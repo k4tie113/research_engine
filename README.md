@@ -1,8 +1,8 @@
-# 📚 Research Paper Search Engine (Phase 1 – Data & Storage)
+# Research Paper Search Engine (Phase 1 – Data & Storage)
 
 This project ingests NLP research papers from **arXiv**, organizes them, and exposes simple functions for retrieval and QA experiments.
 
-**NOTE**
+**NOTE:**
 The search function in storage_api.py is a basic SQL LIKE search: it just looks for the exact keyword string inside abstracts and returns any matching papers. This means it only finds literal matches (e.g., "transformer") and does not understand synonyms, context, or semantic similarity like Asta does.
 
 
