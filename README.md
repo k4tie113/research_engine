@@ -68,16 +68,12 @@ You may delete `data/pdfs/` after chunking if disk space is tight.
 
 ## Next Steps – Integrating GritLM Embeddings
 
-1. Install GritLM following the model’s documentation.  
-2. Read `data/chunks.jsonl` line by line; embed each `chunk_text` with GritLM.  
-3. Store embeddings in a local vector index (e.g., FAISS or SQLite + pgvector).  
+We now have a clean dataset of recent arXiv NLP papers ( i will find a way to expand this dataset ): their PDFs have been downloaded, converted to text, and split into overlapping ~800-token chunks saved in data/chunks.jsonl.
 
-Query flow:
-- Embed the user’s query with GritLM.  
-- Retrieve the most similar chunk vectors.  
-- Feed the retrieved chunks and query to your LLM as context.  
+Next step is to embed each chunk (for example with GritLM) and store the vectors with metadata in a vector database such as FAISS or pgvector.
 
-These embedding steps are independent of the downloading/chunking pipeline.
+From there we can build a retrieval-augmented generation layer that embeds a user query and retrieves the most relevant chunks.
+
 
 ---
 
