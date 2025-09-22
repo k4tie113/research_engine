@@ -1,0 +1,10 @@
+feedparser
+requests
+pypdf
+tiktoken
+regex
+ftfy
+unidecode
+tqdm
+pymupdf
+pdfplumber
