@@ -2,99 +2,128 @@
 """
 chunk_pdfs.py
 -------------
-This script reads every PDF in data/pdfs/,
-extracts the text, and splits it into overlapping chunks
-of about 800 tokens each.
-
-Each chunk is written as a single line of JSON in
-data/chunks.jsonl, along with metadata identifying
-the paper it came from.
-
-No embeddings or model calls are made here—we are
-only preparing the data for later retrieval-augmented
-generation (RAG) steps.
+Extract text from each PDF (multi-backend), clean it, and split into
+~800-token chunks with 200-token overlap. Writes JSONL to data/chunks.jsonl.
 """
 
+from __future__ import annotations
 import csv
 import json
 from pathlib import Path
-from pypdf import PdfReader           # pure-Python PDF text extractor
-import tiktoken                        # tokenizer for measuring tokens
 
-# --------------------------------------------------------------------
-# Base directory = parent of this scripts folder (the project root).
-# This ensures we always read/write inside the repository no matter
-# where we launch the script from.
-# --------------------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent.parent
+from tqdm import tqdm
+import tiktoken
+import fitz          # PyMuPDF
+import pdfplumber
+from pypdf import PdfReader
 
-# Absolute paths inside the project
-METADATA_CSV = BASE_DIR / "data" / "metadata" / "papers.csv"
-PDF_DIR      = BASE_DIR / "data" / "pdfs"
-CHUNKS_PATH  = BASE_DIR / "data" / "chunks.jsonl"
+from text_clean import basic_clean
 
-# --------------------------------------------------------------------
-# Desired chunk size and overlap (both measured in tokens).
-# 800 tokens per chunk with 200-token overlap is typical for RAG.
-# --------------------------------------------------------------------
-MAX_TOKENS   = 800
-OVERLAP      = 200
+ROOT = Path(__file__).resolve().parent.parent
+METADATA_CSV = ROOT / "data" / "metadata" / "papers.csv"
+PDF_DIR = ROOT / "data" / "pdfs"
+OUT_JSONL = ROOT / "data" / "chunks.jsonl"
 
-# Initialize tokenizer compatible with common OpenAI embeddings.
-enc = tiktoken.get_encoding("cl100k_base")
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 200
+MIN_DOC_TOKENS = 50  # skip garbage extracts
+ENC = tiktoken.get_encoding("cl100k_base")
 
-def pdf_to_text(pdf_path: Path) -> str:
-    """
-    Extract all text from a PDF, page by page.
-    """
-    reader = PdfReader(str(pdf_path))
-    return "\n".join(page.extract_text() or "" for page in reader.pages)
+def token_len(text: str) -> int:
+    return len(ENC.encode(text))
 
-def chunk_by_tokens(text: str, max_tokens: int, overlap: int):
-    """
-    Split text into overlapping chunks of approximately max_tokens tokens.
-    """
-    tokens = enc.encode(text)
-    chunks = []
-    start = 0
-    while start < len(tokens):
-        end = min(start + max_tokens, len(tokens))
-        chunk = enc.decode(tokens[start:end])   # decode back to text
-        chunks.append(chunk)
-        start += max_tokens - overlap           # slide window forward
-    return chunks
+def extract_text_pymupdf(pdf_path: Path) -> str:
+    try:
+        doc = fitz.open(pdf_path)
+        return "\n".join(page.get_text("text") for page in doc)
+    except Exception:
+        return ""
+
+def extract_text_pdfplumber(pdf_path: Path) -> str:
+    try:
+        out = []
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                out.append(page.extract_text() or "")
+        return "\n".join(out)
+    except Exception:
+        return ""
+
+def extract_text_pypdf(pdf_path: Path) -> str:
+    try:
+        reader = PdfReader(str(pdf_path))
+        return "\n".join(p.extract_text() or "" for p in reader.pages)
+    except Exception:
+        return ""
+
+def extract_text(pdf_path: Path) -> str:
+    for fn in (extract_text_pymupdf, extract_text_pdfplumber, extract_text_pypdf):
+        txt = fn(pdf_path)
+        if txt and txt.strip():
+            return txt
+    return ""
+
+def sliding_windows(tokens, size: int, overlap: int):
+    step = max(1, size - overlap)
+    i = 0
+    n = len(tokens)
+    while i < n:
+        j = min(n, i + size)
+        yield i, j
+        if j >= n:
+            break
+        i += step
+
+def chunk_tokens_to_text(tokens, size: int, overlap: int):
+    for idx, (s, e) in enumerate(sliding_windows(tokens, size, overlap)):
+        subtoks = tokens[s:e]
+        yield idx, ENC.decode(subtoks), len(subtoks)
+
+def load_meta(csv_path: Path):
+    meta = {}
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            meta[row["id"]] = {
+                "title": row.get("title", ""),
+                "authors": row.get("authors", ""),
+            }
+    return meta
 
 def main():
-    """
-    1. Read paper metadata from the CSV.
-    2. For each paper, load its PDF and extract text.
-    3. Break the text into overlapping chunks.
-    4. Write one JSON object per chunk to chunks.jsonl.
-    """
-    with open(METADATA_CSV, newline="", encoding="utf-8") as fmeta, \
-         open(CHUNKS_PATH, "w", encoding="utf-8") as fout:
-        reader = csv.DictReader(fmeta)
-        for row in reader:
-            pdf_file = PDF_DIR / f"{row['id']}.pdf"
+    assert METADATA_CSV.exists(), f"Missing {METADATA_CSV}. Run fetch_metadata.py"
+    assert PDF_DIR.exists(), f"Missing {PDF_DIR}. Run download_pdfs.py"
 
-            if not pdf_file.exists():
-                print(f"PDF missing: {row['id']}")
+    meta = load_meta(METADATA_CSV)
+    pdfs = sorted(PDF_DIR.glob("*.pdf"))
+    OUT_JSONL.parent.mkdir(parents=True, exist_ok=True)
+
+    written = 0
+    with open(OUT_JSONL, "w", encoding="utf-8") as out_f:
+        for pdf_path in tqdm(pdfs, desc="Chunking PDFs"):
+            pid = pdf_path.stem
+            m = meta.get(pid, {"title": "", "authors": ""})
+
+            raw = extract_text(pdf_path)
+            if not raw.strip():
                 continue
 
-            text = pdf_to_text(pdf_file)
+            cleaned = basic_clean(raw, drop_refs=True)
+            if token_len(cleaned) < MIN_DOC_TOKENS:
+                continue
 
-            for i, chunk in enumerate(chunk_by_tokens(text, MAX_TOKENS, OVERLAP)):
-                record = {
-                    "paper_id": row["id"],
-                    "title": row["title"],
-                    "authors": row["authors"],
-                    "chunk_index": i,
-                    "chunk_text": chunk
-                }
-                fout.write(json.dumps(record) + "\n")
-            print(f"Chunked {row['id']}")
+            toks = ENC.encode(cleaned)
+            for idx, txt, tok_count in chunk_tokens_to_text(toks, CHUNK_SIZE, CHUNK_OVERLAP):
+                out_f.write(json.dumps({
+                    "paper_id": pid,
+                    "chunk_index": idx,
+                    "title": m["title"],
+                    "authors": m["authors"],
+                    "token_count": tok_count,
+                    "chunk_text": txt
+                }, ensure_ascii=False) + "\n")
+                written += 1
 
-    print(f"\nChunks written to: {CHUNKS_PATH.resolve()}")
+    print(f"Wrote {written} chunks → {OUT_JSONL.resolve()}")
 
 if __name__ == "__main__":
     main()
