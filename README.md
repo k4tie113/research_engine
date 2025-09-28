@@ -12,7 +12,7 @@ Uses the **arXiv OAI-PMH interface (https://oaipmh.arxiv.org/oai)** to harvest a
 Requests the official set spec **cs:cs:CL**, automatically follows resumption tokens so there is no 5 000-record limit, and writes
 data/metadata/papers_oai.csv with columns: id, title, authors, abstract, categories, datestamp.
 
-### `download_pdfs.py`
+### `download_oai.py`
 Reads papers_oai.csv and downloads each paper’s PDF to **data/pdfs/<sanitized_id>.pdf**.
 Builds the correct arXiv PDF URL (https://arxiv.org/pdf/<id>.pdf) and replaces any “/” in old-style IDs with “_” for the local file name to avoid folder-path errors.
 Streams each PDF in chunks to avoid high memory usage.
