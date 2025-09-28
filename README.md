@@ -6,6 +6,17 @@ This repo provides a **local, end-to-end pipeline** for preparing arXiv NLP pape
 
 ## How the Pipeline Works
 
+### UPDATE 9/28
+### `fetch_oai.py`
+Uses the **arXiv OAI-PMH interface (https://oaipmh.arxiv.org/oai)** to harvest all Computational Linguistics (cs.CL) papers.
+Requests the official set spec **cs:cs:CL**, automatically follows resumption tokens so there is no 5 000-record limit, and writes
+data/metadata/papers_oai.csv with columns: id, title, authors, abstract, categories, datestamp.
+
+### `download_pdfs.py`
+Reads papers_oai.csv and downloads each paper’s PDF to **data/pdfs/<sanitized_id>.pdf**.
+Builds the correct arXiv PDF URL (https://arxiv.org/pdf/<id>.pdf) and replaces any “/” in old-style IDs with “_” for the local file name to avoid folder-path errors.
+Streams each PDF in chunks to avoid high memory usage.
+
 ### `fetch_metadata.py`
 Calls the arXiv API for category `cs.CL` and writes `data/metadata/papers.csv` with columns: `id`, `title`, `authors`, `pdf_url`.  
 **Note:** Intentionally limited to **300 papers per run** to respect arXiv rate limits.
