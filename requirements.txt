@@ -8,3 +8,9 @@ unidecode
 tqdm
 pymupdf
 pdfplumber
+langchain
+langchain-community
+huggingface-hub
+faiss-cpu
+langchain-huggingface
+sentence-transformers
