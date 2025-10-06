@@ -1,0 +1,48 @@
+.App {
+  font-family: system-ui, sans-serif;
+  max-width: 800px;
+  margin: 40px auto;
+  padding: 20px;
+  text-align: center;
+}
+
+header h1 {
+  margin-bottom: 5px;
+  color: #4b61e1;
+}
+
+.search-bar {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  margin: 20px 0;
+}
+
+.search-bar input {
+  width: 60%;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid #ccc;
+}
+
+.search-bar button {
+  padding: 10px 15px;
+  background-color: #4b61e1;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.results {
+  margin-top: 30px;
+  text-align: left;
+}
+
+.paper-card {
+  background: #f7f8fa;
+  border-radius: 12px;
+  padding: 15px;
+  margin-bottom: 15px;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.05);
+}

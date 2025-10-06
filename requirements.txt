@@ -8,3 +8,8 @@ unidecode
 tqdm
 pymupdf
 pdfplumber
+
+flask
+requests
+flask-cors
+python-dotenv
