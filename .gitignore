@@ -2,3 +2,9 @@ venv/
 data/
 *.pdf
 *.txt
+
+.env
+
+
+.env
+
