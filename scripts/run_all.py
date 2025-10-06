@@ -19,6 +19,7 @@ in the correct order.
 """
 
 import subprocess
+import sys
 from pathlib import Path
 
 # --------------------------------------------------------------------
@@ -43,7 +44,8 @@ def run_script(script_name: str):
     """
     print(f"\n=== Running {script_name} ===")
     # Use subprocess.run so that output is streamed directly to the console.
-    subprocess.run(["python", str(SCRIPT_DIR / script_name)], check=True)
+    # Use the same Python interpreter that's running this script (e.g., your venv)
+    subprocess.run([sys.executable, str(SCRIPT_DIR / script_name)], check=True)
 
 def main():
     """

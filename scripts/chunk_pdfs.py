@@ -30,7 +30,8 @@ MIN_DOC_TOKENS = 50  # skip garbage extracts
 ENC = tiktoken.get_encoding("cl100k_base")
 
 def token_len(text: str) -> int:
-    return len(ENC.encode(text))
+    # Allow special tokens during encoding to avoid ValueError on strings containing them
+    return len(ENC.encode(text, disallowed_special=()))
 
 def extract_text_pymupdf(pdf_path: Path) -> str:
     try:
@@ -111,7 +112,8 @@ def main():
             if token_len(cleaned) < MIN_DOC_TOKENS:
                 continue
 
-            toks = ENC.encode(cleaned)
+            # Allow special tokens to be encoded without raising
+            toks = ENC.encode(cleaned, disallowed_special=())
             for idx, txt, tok_count in chunk_tokens_to_text(toks, CHUNK_SIZE, CHUNK_OVERLAP):
                 out_f.write(json.dumps({
                     "paper_id": pid,
