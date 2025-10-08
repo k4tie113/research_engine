@@ -16,9 +16,10 @@ import requests
 from pathlib import Path
 
 # === CONFIG ===
-CSV_PATH = Path("data/metadata/papers_oai.csv")
-PDF_DIR = Path("data/pdfs")
-CHECKPOINT_PATH = Path("data/download_checkpoint.txt")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CSV_PATH = PROJECT_ROOT / "data" / "metadata" / "papers.csv"
+PDF_DIR = PROJECT_ROOT / "data" / "pdfs"
+CHECKPOINT_PATH = PROJECT_ROOT / "data" / "download_checkpoint.txt"
 BATCH_SIZE = 3000
 
 PDF_DIR.mkdir(parents=True, exist_ok=True)
