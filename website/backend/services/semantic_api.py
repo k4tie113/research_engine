@@ -6,7 +6,7 @@ def search_semantic(query):
     res = requests.get(url)
 
     if res.status_code != 200:
-        return [{"title": "Error fetching papers", "authors": [], "year": None, "abstract": "", "url": ""}]
+        return []
 
     data = res.json()
     results = []
