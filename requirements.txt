@@ -13,3 +13,4 @@ flask
 requests
 flask-cors
 python-dotenv
+elasticsearch==8.14.0
