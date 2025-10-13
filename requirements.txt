@@ -13,3 +13,8 @@ flask
 requests
 flask-cors
 python-dotenv
+langchain
+langchain-huggingface
+langchain-community
+transformers
+torch
