@@ -13,3 +13,7 @@ flask
 requests
 flask-cors
 python-dotenv
+elasticsearch==8.14.0
+transformers>=4.30.0
+torch>=2.0.0
+accelerate
