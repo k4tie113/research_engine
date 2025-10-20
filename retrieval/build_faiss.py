@@ -24,8 +24,8 @@ def main():
         for i, m in enumerate(metas):
             f.write(json.dumps({"row_id": i, **m}, ensure_ascii=False) + "\n")
 
-    print(f"Indexed {X.shape[0]} vectors (dim={dim}) → {OUT_DIR/'index_flatip.faiss'}")
-    print(f"IDs map → {OUT_DIR/'ids.jsonl'}")
+    print(f"Indexed {X.shape[0]} vectors (dim={dim}) -> {OUT_DIR/'index_flatip.faiss'}")
+    print(f"IDs map -> {OUT_DIR/'ids.jsonl'}")
 
 if __name__ == "__main__":
     main()

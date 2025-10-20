@@ -51,8 +51,8 @@ def main():
     with jsonlines.open(EMB_DIR / "metadata.jsonl", "w") as w:
         for m in metas:
             w.write(m)
-    print(f"Wrote {X.shape} → {EMB_DIR/'embeddings.npy'}")
-    print(f"Metadata → {EMB_DIR/'metadata.jsonl'}")
+    print(f"Wrote {X.shape} -> {EMB_DIR/'embeddings.npy'}")
+    print(f"Metadata -> {EMB_DIR/'metadata.jsonl'}")
 
 if __name__ == "__main__":
     main()
