@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-generate_with_context_hfapi.py
+generate_with_context_openai.py
 ------------------------------
 Retrieves top-k chunks from your FAISS index and sends the context
-to the Hugging Face Inference API for generation using Mistral-7B-Instruct.
+to OpenAI's GPT-4o mini for generation.
 """
 
 import faiss, numpy as np, jsonlines, textwrap
+import os
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
-from huggingface_hub import InferenceClient
+from openai import OpenAI
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # === CONFIG ===
-MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.2"
+MODEL_ID = "gpt-4o-mini"
 TOP_K = 15
 MAX_NEW_TOKENS = 600
 
@@ -37,12 +42,9 @@ with jsonlines.open(CHUNKS_PATH, "r") as reader:
     for rec in reader:
         chunks[(rec["paper_id"], rec["chunk_index"])] = rec["chunk_text"]
 
-# === CONNECT TO HUGGING FACE INFERENCE API ===
-print(f"Connecting to Hugging Face Inference API ({MODEL_ID})...")
-client = InferenceClient(
-    model="mistralai/Mistral-7B-Instruct-v0.2",
-    token="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"
-)
+# === CONNECT TO OPENAI API ===
+print(f"Connecting to OpenAI API ({MODEL_ID})...")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # === MAIN LOOP ===
 import sys
@@ -79,32 +81,24 @@ for rank, idx in enumerate(I[0]):
     retrieved_texts.append(snippet)
 
 context = "\n\n".join(retrieved_texts)
-prompt = f"""You are a helpful research assistant.
-Use the following context to answer the user's question clearly and concisely.
 
-CONTEXT:
-{context}
+print("Generating answer from GPT-4o mini...\n")
 
-QUESTION:
-{query}
+try:
+    response = client.chat.completions.create(
+        model=MODEL_ID,
+        messages=[
+            {"role": "system", "content": "You are a helpful research assistant. Use the provided context to answer questions clearly and concisely. If the context doesn't contain enough information, say so."},
+            {"role": "user", "content": f"Context from academic papers:\n\n{context}\n\nQuestion: {query}\n\nPlease provide a comprehensive answer based on the context above."}
+        ],
+        max_tokens=MAX_NEW_TOKENS,
+        temperature=0.7
+    )
 
-ANSWER:
-"""
+    print("Answer:\n")
+    print(response.choices[0].message.content)
+    print("\n" + "="*90)
 
-print("Generating answer from Mistral (Hugging Face API)...\n")
-
-response = client.chat_completion(
-    model=MODEL_ID,
-    messages=[
-        {"role": "system", "content": "You are a helpful research assistant."},
-        {"role": "user", "content": f"Use the following context to answer clearly and concisely:\n\n{context}\n\nQuestion: {query}"}
-    ],
-    max_tokens=MAX_NEW_TOKENS,
-    temperature=0.7,
-    top_p=0.9
-)
-
-print("Answer:\n")
-print(response.choices[0].message["content"])
-print("\n" + "="*90)
-
+except Exception as e:
+    print(f"Error calling OpenAI API: {e}")
+    print("Make sure your OPENAI_API_KEY is set in the .env file")

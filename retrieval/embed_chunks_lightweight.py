@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
 """
-embed_chunks_bge.py
--------------------
-Embeds chunked paper text (from chunk_pdfs_oai.py) using
-the BAAI/bge-base-en-v1.5 model and stores:
-    - NumPy embedding matrix
-    - Metadata JSONL
-    - FAISS index for retrieval
-
-Input:  data/chunks.jsonl
-Output: data/embeddings/embeddings_bge.npy
-        data/embeddings/metadata_bge.jsonl
-        data/embeddings/faiss_index_bge.bin
+embed_chunks_lightweight.py
+---------------------------
+Lightweight embedding script using all-MiniLM-L6-v2 (much faster than BGE).
+Creates embeddings and FAISS index for the Mistral RAG script.
 """
 
 import os, json, jsonlines, numpy as np
@@ -27,18 +19,19 @@ EMB_DIR = ROOT / "database" / "data" / "embeddings"
 EMB_DIR.mkdir(parents=True, exist_ok=True)
 
 # === MODEL CONFIG ===
-MODEL_NAME = os.environ.get("BGE_MODEL", "BAAI/bge-base-en-v1.5")
-DEVICE = os.environ.get("BGE_DEVICE", "cuda" if torch.cuda.is_available() else "cpu").lower()
-BATCH_SIZE = int(os.environ.get("BGE_BATCH", 32))
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+MODEL_NAME = "all-MiniLM-L6-v2"  # Much lighter than BGE
+DEVICE = "cpu"  # Keep on CPU for simplicity
+BATCH_SIZE = 128  # Larger batch since model is smaller
+MAX_CHUNKS = 1000  # Limit for testing
 
 # === FAISS CONFIG ===
-FAISS_PATH = EMB_DIR / "faiss_index_bge.bin"
+FAISS_PATH = EMB_DIR / "faiss_index_bge.bin"  # Keep same name for compatibility
+METADATA_PATH = EMB_DIR / "metadata_bge.jsonl"  # Keep same name for compatibility
 
-def main(batch_size: int = BATCH_SIZE, max_chunks: int | None = None):
+def main(max_chunks: int = MAX_CHUNKS):
     assert CHUNKS.exists(), f"Missing {CHUNKS}; run the PDF pipeline first."
 
-    print(f"Loading model {MODEL_NAME} (device={DEVICE})...")
+    print(f"Loading lightweight model {MODEL_NAME} (device={DEVICE})...")
     model = SentenceTransformer(MODEL_NAME, device=DEVICE)
     dim = model.get_sentence_embedding_dimension()
     print(f"Model loaded (dim={dim})")
@@ -69,8 +62,8 @@ def main(batch_size: int = BATCH_SIZE, max_chunks: int | None = None):
 
     print(f"Encoding {len(texts)} chunks using {MODEL_NAME}...")
     embs = []
-    for i in tqdm(range(0, len(texts), batch_size), desc="Embedding"):
-        batch = texts[i:i+batch_size]
+    for i in tqdm(range(0, len(texts), BATCH_SIZE), desc="Embedding"):
+        batch = texts[i:i+BATCH_SIZE]
         with torch.inference_mode():
             vecs = model.encode(batch, normalize_embeddings=True)
         vecs = np.asarray(vecs, dtype=np.float32)
@@ -79,12 +72,12 @@ def main(batch_size: int = BATCH_SIZE, max_chunks: int | None = None):
 
     # === SAVE EMBEDDINGS + METADATA ===
     np.save(EMB_DIR / "embeddings_bge.npy", embs)
-    with jsonlines.open(EMB_DIR / "metadata_bge.jsonl", "w") as w:
+    with jsonlines.open(METADATA_PATH, "w") as w:
         for m in metas:
             w.write(m)
 
     print(f"Saved embeddings: {embs.shape} -> {EMB_DIR/'embeddings_bge.npy'}")
-    print(f"Saved metadata: {EMB_DIR/'metadata_bge.jsonl'}")
+    print(f"Saved metadata: {METADATA_PATH}")
 
     # === CREATE AND SAVE FAISS INDEX ===
     print("Building FAISS index (cosine similarity)...")
@@ -92,9 +85,9 @@ def main(batch_size: int = BATCH_SIZE, max_chunks: int | None = None):
     index.add(embs)
     faiss.write_index(index, str(FAISS_PATH))
     print(f"FAISS index saved -> {FAISS_PATH}")
-    print("Done! Your BGE embeddings are ready for retrieval.")
+    print("Done! Your lightweight embeddings are ready for retrieval.")
 
 if __name__ == "__main__":
     import sys
-    max_chunks = int(sys.argv[1]) if len(sys.argv) > 1 else None
+    max_chunks = int(sys.argv[1]) if len(sys.argv) > 1 else MAX_CHUNKS
     main(max_chunks=max_chunks)
