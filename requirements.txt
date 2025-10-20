@@ -1,5 +1,4 @@
 feedparser
-requests
 pypdf
 tiktoken
 regex
@@ -8,7 +7,6 @@ unidecode
 tqdm
 pymupdf
 pdfplumber
-
 flask
 requests
 flask-cors
@@ -17,3 +15,10 @@ elasticsearch==8.14.0
 transformers>=4.30.0
 torch>=2.0.0
 accelerate
+langchain
+langchain-huggingface
+langchain-community
+sentence-transformers
+faiss-cpu
+openai
+huggingface-hub
