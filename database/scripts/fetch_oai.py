@@ -1,101 +1,70 @@
-#!/usr/bin/env python3
-"""
-fetch_oai.py
--------------
-Harvest ALL Computational Linguistics (cs.CL) papers from arXiv using OAI-PMH.
-Supports automatic resumption (via resumption tokens), checkpointing, and retries.
-"""
-
+import sys, csv, xml.etree.ElementTree as ET, requests
 from pathlib import Path
-import csv
-import time
-from sickle import Sickle
-from sickle.models import Record
-from sickle.oaiexceptions import NoRecordsMatch
+from time import sleep
 
+BASE_URL = "http://export.arxiv.org/oai2"
+TARGET_CATEGORIES = {"cs.CL", "cs.LG", "cs.AI", "cs.CV"}
 
-CSV_PATH = Path("data/metadata/papers_oai.csv")
-CHECKPOINT_FILE = Path("data/metadata/checkpoint.txt")
-CHECKPOINT_SIZE = 1000    # print progress every N papers
-RETRY_DELAY = 15          # seconds to wait after temporary failure
+year = int(sys.argv[1])
+params = {
+    "verb": "ListRecords",
+    "metadataPrefix": "arXiv",
+    "set": "cs",
+    "from": f"{year}-01-01",
+    "until": f"{year}-12-31",
+}
 
+OUTPUT_DIR = Path(__file__).resolve().parents[1] / "data" / "metadata"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_FILE = OUTPUT_DIR / f"papers_{year}.csv"
 
-def safe_join_author_list(author_list):
-    """Return a '; ' joined string, ignoring None values."""
-    return "; ".join([a for a in author_list if isinstance(a, str)])
+total = 0
+token = None
 
+with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
+    writer = csv.writer(f)
+    writer.writerow(["id", "title", "authors", "abstract", "categories", "created"])
 
-def get_last_checkpoint():
-    """Return the number of papers already harvested."""
-    if CHECKPOINT_FILE.exists():
+    while True:
+        if token:
+            params = {"verb": "ListRecords", "resumptionToken": token}
+
         try:
-            with open(CHECKPOINT_FILE, "r") as f:
-                return int(f.read().strip())
-        except Exception:
-            return 0
-    return 0
-
-
-def save_checkpoint(count):
-    """Save how many papers have been harvested so far."""
-    CHECKPOINT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(CHECKPOINT_FILE, "w") as f:
-        f.write(str(count))
-
-
-def main():
-    sickle = Sickle("https://oaipmh.arxiv.org/oai")
-    start_index = get_last_checkpoint()
-    kept = start_index
-
-    print(f"📂 Resuming from checkpoint: {kept} papers already harvested\n")
-
-    mode = "a" if start_index > 0 else "w"
-    with open(CSV_PATH, mode, newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["id", "title", "authors", "abstract", "categories", "datestamp"]
-        )
-        if start_index == 0:
-            writer.writeheader()
-
-        print("🚀 Starting FULL cs.CL harvest from arXiv (OAI-PMH)")
-        print("    This may take many hours; arXiv updates nightly.\n")
-
-        records = None
-        try:
-            records = sickle.ListRecords(metadataPrefix="arXiv", set="cs:cs:CL")
-            for record in records:
-                if not isinstance(record, Record):
-                    continue
-
-                meta = record.metadata
-                categories = [c for c in meta.get("categories", []) if c]
-
-                kept += 1
-                writer.writerow({
-                    "id": meta.get("id", [""])[0],
-                    "title": (meta.get("title", [""])[0] or "").replace("\n", " ").strip(),
-                    "authors": safe_join_author_list(meta.get("authors", [])),
-                    "abstract": (meta.get("abstract", [""])[0] or "").replace("\n", " ").strip(),
-                    "categories": " ".join(categories),
-                    "datestamp": record.header.datestamp,
-                })
-
-                if kept % CHECKPOINT_SIZE == 0:
-                    print(f"✅ {kept} cs.CL papers saved so far...")
-                    save_checkpoint(kept)
-
-        except (SickleException, NoRecordsMatch) as e:
-            print(f"⚠️ OAI error: {e}. Retrying in {RETRY_DELAY}s...")
-            time.sleep(RETRY_DELAY)
+            r = requests.get(BASE_URL, params=params, timeout=90)
+            r.raise_for_status()
         except Exception as e:
-            print(f"❌ Unexpected error: {e}")
-        finally:
-            print(f"\n🎉 Harvest complete!")
-            print(f"   Total cs.CL papers written: {kept}")
-            save_checkpoint(kept)
-            print(f"   Output: {CSV_PATH.resolve()}")
+            print(f"[{year}] {e}, retrying in 10s...")
+            sleep(10)
+            continue
 
+        root = ET.fromstring(r.text)
+        for rec in root.findall(".//{http://www.openarchives.org/OAI/2.0/}record"):
+            meta = rec.find(".//{http://arxiv.org/OAI/arXiv/}arXiv")
+            if meta is None: 
+                continue
+            cats = meta.findtext("{http://arxiv.org/OAI/arXiv/}categories", "")
+            if not any(c in cats.split() for c in TARGET_CATEGORIES):
+                continue
 
-if __name__ == "__main__":
-    main()
+            title = meta.findtext("{http://arxiv.org/OAI/arXiv/}title", "").replace("\n"," ").strip()
+            abstr = meta.findtext("{http://arxiv.org/OAI/arXiv/}abstract", "").replace("\n"," ").strip()
+            aid   = meta.findtext("{http://arxiv.org/OAI/arXiv/}id", "")
+            date  = meta.findtext("{http://arxiv.org/OAI/arXiv/}created", "")
+            authors = [
+                (a.findtext("{http://arxiv.org/OAI/arXiv/}forenames","") + " " +
+                 a.findtext("{http://arxiv.org/OAI/arXiv/}keyname","")).strip()
+                for a in meta.findall(".//{http://arxiv.org/OAI/arXiv/}author")
+            ]
+            writer.writerow([aid, title, "; ".join(authors), abstr, cats, date])
+            total += 1
+            if total % 5000 == 0:
+                print(f"[{year}] Downloaded {total:,}")
+
+        tok_elem = root.find(".//{http://www.openarchives.org/OAI/2.0/}resumptionToken")
+        if tok_elem is not None and tok_elem.text:
+            token = tok_elem.text
+            sleep(1)
+        else:
+            break
+
+print(f"[{year}] Done, saved {total:,} records to {OUTPUT_FILE}")
