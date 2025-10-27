@@ -38,59 +38,44 @@ Paths are resolved relative to the repository root (via __file__) so outputs alw
 
 ---
 
-## How to Run
-
-### 1 Setup
+## Setup
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
+## Creating Vector Store
 
-`requirements.txt` should include:
-```
-feedparser
-requests
-pypdf
-tiktoken
-```
+### From Drive (recommended)
+- Place `embeddings_minilm.npy`, `faiss_index_minilm.bin`, and `metadata_minilm.jsonl` in `database\data\embeddings`
+- Place `chunks_oai.jsonl` in `database\data`
 
-### 2 End-to-end (recommended)
+### End-to-end
 ```bash
 python scripts/run_all.py
 ```
-### 3 Or step-by-step
+### Or step-by-step
 ```bash
 python scripts/fetch_metadata.py
 python scripts/download_pdfs.py
 python scripts/chunk_pdfs.py
 ```
-
----
-
-## Outputs
+### Outputs
 - `data/metadata/papers.csv`  
 - `data/pdfs/*.pdf`  
 - `data/chunks.jsonl`  
 
 You may delete `data/pdfs/` after chunking if disk space is tight.
 
----
+## Running Website
 
-## Next Steps – Integrating GritLM Embeddings
+### Backend
+```bash
+python .\website\backend\app.py
+```
 
-We now have a clean dataset of recent arXiv NLP papers ( i will find a way to expand this dataset ): their PDFs have been downloaded, converted to text, and split into overlapping ~800-token chunks saved in data/chunks.jsonl.
-
-Next step is to embed each chunk (for example with GritLM) and store the vectors with metadata in a vector database such as FAISS or pgvector.
-
-From there we can build a retrieval-augmented generation layer that embeds a user query and retrieves the most relevant chunks.
-
-
----
-
-## Notes and Caveats
-- **Limited download size:** Default is the latest 300 papers. Increase `BATCH_SIZE` in `fetch_metadata.py` if needed (be considerate of arXiv limits).  
-- **PDF text quality:** Equations, tables, and multi-column layouts may extract imperfectly; consider `pdfplumber` or `PyMuPDF` if accuracy is critical.  
-- **Token size:** Default 800 tokens per chunk with 200 overlap using `cl100k_base`. Adjust if your embedding model uses a different tokenizer.  
-- **Disk usage:** PDFs can be deleted after chunking; the JSONL file contains all text needed for embedding.  
-- **Reproducibility:** Because chunking depends on tokenization, changing the tokenizer or parameters requires re-chunking for consistent retrieval.  
+### Frontend
+```bash
+cd .\website\paperfinder
+npm start
+```
