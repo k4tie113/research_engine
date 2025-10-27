@@ -6,6 +6,9 @@ This repo provides a **local, end-to-end pipeline** for preparing arXiv NLP pape
 
 ## How the Pipeline Works
 
+### UPDATE 10/27
+*All* of the core logic of the backend service is performed within the `website\backend` directory. Specifically, `app.py` contains the API endpoints and `rag_service.py` contains most of the logic. None of the files in `\retrieval` are called or used by the website.
+
 ### UPDATE 9/28
 ### `fetch_oai.py`
 Uses the **arXiv OAI-PMH interface (https://oaipmh.arxiv.org/oai)** to harvest all Computational Linguistics (cs.CL) papers.
