@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import axios from "axios";
 
 function App() {
@@ -12,6 +12,20 @@ function App() {
   // Get current conversation
   const activeConversation = conversations.find(c => c.id === activeConversationId) || conversations[0];
   const messages = activeConversation.messages;
+
+  // Typeset LaTeX after messages render/update
+  useEffect(() => {
+    const typeset = async () => {
+      try {
+        if (window.MathJax && window.MathJax.typesetPromise) {
+          await window.MathJax.typesetPromise();
+        }
+      } catch (e) {
+        // no-op
+      }
+    };
+    typeset();
+  }, [messages]);
 
   // Create new conversation
   const createNewConversation = () => {
@@ -75,46 +89,73 @@ function App() {
       // Build conversation history from previous messages (excluding the greeting)
       const conversationHistory = updatedMessages
         .filter(msg => msg.role !== "bot" || msg.message !== "Hi! I'm your research assistant. Ask me about any topic.")
-        .slice(-6) // Keep last 6 messages (3 exchanges)
+        .slice(-6)
         .map(msg => ({
           role: msg.role === "bot" ? "assistant" : "user",
           content: msg.message
         }));
       
-      const res = await axios.post("http://127.0.0.1:5000/api/chat", { 
-        message: currentQuery,
-        conversation_history: conversationHistory
-      });
-      
-      // Parse the response to separate answer from sources
-      const reply = res.data.reply;
-      const sourcesMatch = reply.match(/\*\*Sources:\*\*\s*((?:[\d]\.\s*\[[^\]]+\]\s*[^\n]+\n?)+)/);
-      
-      let botMessage;
-      if (sourcesMatch) {
-        const answer = reply.substring(0, sourcesMatch.index).trim();
-        const sourcesText = sourcesMatch[1];
-        const sources = [];
-        
-        // Parse sources
-        const sourceLines = sourcesText.match(/\d+\.\s*\[([^\]]+)\]\s*(.+)/g);
-        if (sourceLines) {
-          sourceLines.forEach(line => {
-            const match = line.match(/\d+\.\s*\[([^\]]+)\]\s*(.+)/);
-            if (match) {
-              sources.push({ paper_id: match[1], title: match[2].trim() });
-            }
-          });
-        }
-        
-        botMessage = { role: "bot", message: answer, sources: sources };
-      } else {
-        botMessage = { role: "bot", message: reply, sources: [] };
-      }
-
-      // Update conversation with bot message and remove loading state
+      // Insert a placeholder bot message we will update progressively
+      const placeholderIndex = updatedMessages.length; // next index
       setConversations(convs =>
-        convs.map(c => c.id === activeConversationId ? { ...c, messages: [...updatedMessages, botMessage], loading: false } : c)
+        convs.map(c => c.id === activeConversationId ? { ...c, messages: [...updatedMessages, { role: "bot", message: "", sources: [] }] } : c)
+      );
+
+      const res = await fetch("http://127.0.0.1:5000/api/chat_stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: currentQuery, conversation_history: conversationHistory }),
+      });
+
+      if (!res.body) throw new Error("No response body");
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+      let fullText = "";
+      let finalSources = [];
+
+      const processBuffer = (buf) => {
+        const lines = buf.split("\n\n");
+        for (let i = 0; i < lines.length - 1; i++) {
+          const line = lines[i].trim();
+          if (line.startsWith("data: ")) {
+            try {
+              const payload = JSON.parse(line.slice(6));
+              if (payload.event === "delta" && payload.text) {
+                fullText += payload.text;
+                // Update the last bot message progressively
+                setConversations(convs => convs.map(c => {
+                  if (c.id !== activeConversationId) return c;
+                  const newMessages = [...c.messages];
+                  newMessages[placeholderIndex] = { role: "bot", message: fullText, sources: [] };
+                  return { ...c, messages: newMessages };
+                }));
+              } else if (payload.event === "done") {
+                finalSources = payload.sources || [];
+              }
+            } catch {}
+          }
+        }
+        return lines[lines.length - 1];
+      };
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        buffer = processBuffer(buffer);
+      }
+      // Flush remaining buffer
+      if (buffer) buffer = processBuffer(buffer + "\n\n");
+
+      // Finalize: set sources and clear loading
+      setConversations(convs =>
+        convs.map(c => {
+          if (c.id !== activeConversationId) return c;
+          const newMessages = [...c.messages];
+          newMessages[placeholderIndex] = { role: "bot", message: fullText, sources: finalSources };
+          return { ...c, messages: newMessages, loading: false };
+        })
       );
     } catch (err) {
       const errorMessage = { role: "bot", message: "⚠️ Backend not reachable. Make sure Flask is running.", sources: [] };
@@ -195,13 +236,14 @@ function App() {
               backgroundColor: m.role === "user" ? "#d7f3eb" : "#f4f9f7",
             }}
           >
-            {/* Main message content */}
+            {/* Main message content (simple formatting only) */}
             <p
               style={styles.text}
               dangerouslySetInnerHTML={{
                 __html: m.message
-                  .replace(/\*\*(.*?)\*\*/g, "<b>$1</b>")  // bold
-                  .replace(/\n/g, "<br/>"),  // line breaks
+                  .replace(/\*\*(.*?)\*\*/g, "<b>$1</b>")
+                  .replace(/\*(.*?)\*/g, "<i>$1</i>")
+                  .replace(/\n/g, "<br/>")
               }}
             />
             
@@ -220,7 +262,7 @@ function App() {
             )}
           </div>
         ))}
-        {activeConversation.loading && (
+        {activeConversation.loading && !(messages.length > 0 && messages[messages.length - 1].role === "bot") && (
           <div style={{ ...styles.message, backgroundColor: "#f4f9f7" }}>
             <p style={styles.text}>Searching for papers...</p>
           </div>

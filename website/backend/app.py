@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 from pathlib import Path
 import sys
@@ -7,7 +7,7 @@ import sys
 sys.path.append(str(Path(__file__).resolve().parents[2] / "retrieval"))
 
 # Import RAG service from retrieval module
-from rag_service import get_rag_response, format_sources, get_system_status
+from rag_service import get_rag_response, format_sources, get_system_status, stream_rag_response
 
 app = Flask(__name__)
 CORS(app)
@@ -42,6 +42,21 @@ def chat():
     reply = handle_rag_query(message, top_k=5, debug=True, conversation_history=conversation_history)
     
     return jsonify({"reply": reply})
+
+
+@app.route("/api/chat_stream", methods=["POST"])
+def chat_stream():
+    data = request.get_json()
+    message = data.get("message", "").strip()
+    conversation_history = data.get("conversation_history", [])
+
+    if not message:
+        return jsonify({"error": "Please enter a message."}), 400
+
+    def generate():
+        yield from stream_rag_response(message, top_k=5, max_tokens=600, debug=True, conversation_history=conversation_history)
+
+    return Response(generate(), mimetype="text/event-stream")
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
