@@ -21,14 +21,19 @@ print(f"System status: {status}")
 print("RAG system ready!")
 
 def handle_rag_query(query, top_k=5, debug=True, conversation_history=None):
-    """Handle RAG query using the imported service."""
-    answer, sources = get_rag_response(query, top_k=top_k, debug=debug, conversation_history=conversation_history)
-    
-    # Format the response with sources
-    source_text = format_sources(sources, max_sources=5)
-    
-    return answer + source_text
+    answer, result = get_rag_response(query, top_k=top_k, debug=debug, conversation_history=conversation_history)
+    sources = result["sources"]
+    sentence_alignments = result["sentence_alignments"]
 
+    # Optional: still include bottom citations
+    source_text = format_sources(sources, max_sources=5)
+
+    return {
+        "reply": answer + source_text,
+        "sources": sources,
+        "sentence_alignments": sentence_alignments
+    }
+""" COMMENTED OUT CODE
 @app.route("/api/chat", methods=["POST"])
 def chat():
     data = request.get_json()
@@ -42,6 +47,18 @@ def chat():
     reply = handle_rag_query(message, top_k=5, debug=True, conversation_history=conversation_history)
     
     return jsonify({"reply": reply})
+    """
+@app.route("/api/chat", methods=["POST"])
+def chat():
+    data = request.get_json()
+    message = data.get("message", "").strip()
+    conversation_history = data.get("conversation_history", [])
+
+    if not message:
+        return jsonify({"reply": "Please enter a message."})
+
+    result = handle_rag_query(message, top_k=5, debug=True, conversation_history=conversation_history)
+    return jsonify(result)
 
 
 @app.route("/api/chat_stream", methods=["POST"])

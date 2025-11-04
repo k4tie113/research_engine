@@ -147,103 +147,113 @@ def _rewrite_query_with_history(query: str, conversation_history: Optional[List[
         return query
 
 
-def get_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int = DEFAULT_MAX_TOKENS, debug: bool = False, conversation_history: List[Dict] = None) -> Tuple[str, List[Dict]]:
+def get_rag_response(
+    query: str,
+    top_k: int = DEFAULT_TOP_K,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    debug: bool = False,
+    conversation_history: List[Dict] = None
+) -> Tuple[str, Dict[str, List[Dict]]]:
     """
     Get a RAG response for a query with optional conversation history.
-    
-    Args:
-        query: The user query
-        top_k: Number of top chunks to retrieve
-        max_tokens: Maximum tokens for the response
-        debug: Whether to print debug information
-        conversation_history: List of previous messages in format [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
-    
+
     Returns:
-        Tuple of (answer_text, sources_list)
+        Tuple of (answer_text, {"sources": [...], "paragraph_alignments": [...]})
     """
     if not initialize_rag_system():
-        return "RAG system not properly initialized. Please check the logs.", []
-    
-    if not all([_index, _meta, _embed_model, _chunks, _openai_client]):
-        return "RAG system not properly initialized. Please check the logs.", []
-    
-    try:
-        # Build a context-aware retrieval query
-        retrieval_query = _rewrite_query_with_history(query, conversation_history, debug=debug)
-        # Optionally enrich with the original question to broaden recall slightly
-        combined_query = retrieval_query if retrieval_query == query else f"{retrieval_query} \n\nOriginal question: {query}"
+        return "RAG system not properly initialized. Please check the logs.", {"sources": [], "paragraph_alignments": []}
 
-        # Retrieve relevant chunks using the context-aware query
+    if not all([_index, _meta, _embed_model, _chunks, _openai_client]):
+        return "RAG system not properly initialized. Please check the logs.", {"sources": [], "paragraph_alignments": []}
+
+    try:
+        # === Build retrieval query ===
+        retrieval_query = _rewrite_query_with_history(query, conversation_history, debug=debug)
+        combined_query = retrieval_query if retrieval_query == query else f"{retrieval_query}\n\nOriginal question: {query}"
+
+        # === Retrieve top-k chunks ===
         q_emb = _embed_model.encode(combined_query, normalize_embeddings=True)
         D, I = _index.search(np.array([q_emb], dtype="float32"), top_k)
-        
-        retrieved_texts = []
-        sources = []
-        
+
+        retrieved_texts, sources = [], []
         for rank, idx in enumerate(I[0]):
             m = _meta[idx]
             pid, cidx = m["paper_id"], m["chunk_index"]
             full_chunk = _chunks.get((pid, cidx), "")
-            
             retrieved_texts.append(full_chunk)
             sources.append({
                 "paper_id": pid,
-                "title": m.get('title', 'No title'),
+                "title": m.get("title", "No title"),
+                "authors": m.get("authors", []),
                 "chunk_index": cidx,
                 "rank": rank + 1,
-                "similarity_score": float(D[0][rank])
+                "similarity_score": float(D[0][rank]),
+                "chunk_text": full_chunk
             })
-        
+
+        # Sort by similarity descending (best first)
+        sources = sorted(sources, key=lambda s: s["similarity_score"], reverse=True)
+
+        # === 3️⃣ Build LLM prompt ===
         context = "\n\n".join(retrieved_texts)
-        
-        # Build messages array with conversation history
         messages = [
-            {"role": "system", "content": "You are a helpful research assistant. Use the provided context from academic papers to answer questions clearly and concisely. If the context doesn't contain enough information, say so. Always cite the relevant papers when possible. Use conversation history to provide context-aware responses. When including mathematics, write formulas in LaTeX and delimit inline math with \\( ... \\) and display math with \\[ ... \\]. Do not wrap LaTeX in code blocks and do not escape backslashes. Do NOT use headings, tables, or section numbering. Keep formatting simple: short paragraphs, bullet lists ( - item ), and optional bold/italics only."}
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful research assistant. Use the provided context from academic papers "
+                    "to answer questions clearly and concisely. If the context doesn't contain enough information, say so. "
+                    "Always cite the relevant papers when possible. Use conversation history to provide context-aware responses. "
+                    "When including mathematics, write formulas in LaTeX and delimit inline math with \\( ... \\) and display math with \\[ ... \\]. "
+                    "Do not wrap LaTeX in code blocks or escape backslashes."
+                ),
+            }
         ]
-        
-        # Add conversation history if provided
+
         if conversation_history:
-            # Add only recent history (last 4 messages to avoid token limits)
             for msg in conversation_history[-4:]:
                 messages.append(msg)
-        
-        # Add current question with context
+
         messages.append({
-            "role": "user", 
-            "content": f"Context from academic papers:\n\n{context}\n\nQuestion: {query}\n\nPlease provide a comprehensive answer based on the context above. If you include math, use LaTeX with \\(inline\\) or \\[display\\] delimiters, not code fences."
+            "role": "user",
+            "content": (
+                f"Context from academic papers:\n\n{context}\n\n"
+                f"Question: {query}\n\n"
+                "Please provide a comprehensive answer based on the context above."
+            )
         })
+
         if debug:
-            print("\n" + "-" * 80)
-            print("[Generation] Final user message to LLM (answer prompt):")
-            print("-" * 80)
-            print(messages[-1]["content"])
-            print("-" * 80)
-        
-        # Print the full query being sent to GPT
-        if debug:
-            print("\n" + "=" * 80)
-            print("MESSAGES BEING SENT TO GPT:")
-            print("=" * 80)
-            for i, msg in enumerate(messages, 1):
-                print(f"\n--- Message {i} ({msg['role']}) ---")
-                print(msg['content'])
-                print(f"--- End of Message {i} ---\n")
-            print("=" * 80)
-        
-        # Generate response with GPT-4o mini
+            print("[RAG] Sending messages to model ...")
+
         response = _openai_client.chat.completions.create(
             model=MODEL_ID,
             messages=messages,
             max_tokens=max_tokens,
             temperature=0.7
         )
-        
+
         answer = response.choices[0].message.content
-        
-        return answer, sources
-        
+
+        from semantic_alignment import align_paragraphs_to_retrieved_chunks
+
+        paragraph_alignments = align_paragraphs_to_retrieved_chunks(
+            answer_text=full_answer_text,
+            embed_model=_embed_model,
+            retrieved_chunks=sources,
+            top_k=1,
+            threshold=0.25
+        )
+
+
+        if debug:
+            print(f"[RAG] Alignment complete: {len(paragraph_alignments)} sentences aligned.")
+
+        # === Return both answer and metadata ===
+        return answer, {"sources": sources, "paragraph_alignments": paragraph_alignments}
+
     except Exception as e:
-        return f"Error generating response: {str(e)}", []
+        return f"Error generating response: {str(e)}", {"sources": [], "paragraph_alignments": []}
+
 
 
 def format_sources(sources: List[Dict], max_sources: int = 5) -> str:
@@ -271,12 +281,7 @@ def get_system_status() -> Dict:
 
 
 def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int = DEFAULT_MAX_TOKENS, debug: bool = False, conversation_history: List[Dict] = None):
-    """Generator that streams the LLM answer tokens and finally emits sources.
-
-    Yields SSE-like lines: "data: {json}\n\n" where json has either a
-    {"event":"delta","text":"..."} shape or a final
-    {"event":"done","sources":[...]}.
-    """
+    """Generator that streams the LLM answer tokens and finally emits sources and sentence alignments."""
     if not initialize_rag_system() or not all([_index, _meta, _embed_model, _chunks, _openai_client]):
         yield f"data: {json.dumps({'event': 'error', 'message': 'RAG not initialized'})}\n\n"
         return
@@ -290,8 +295,7 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
         q_emb = _embed_model.encode(combined_query, normalize_embeddings=True)
         D, I = _index.search(np.array([q_emb], dtype="float32"), top_k)
 
-        retrieved_texts = []
-        sources = []
+        retrieved_texts, sources = [], []
         for rank, idx in enumerate(I[0]):
             m = _meta[idx]
             pid, cidx = m["paper_id"], m["chunk_index"]
@@ -302,7 +306,8 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
                 "title": m.get('title', 'No title'),
                 "chunk_index": cidx,
                 "rank": rank + 1,
-                "similarity_score": float(D[0][rank])
+                "similarity_score": float(D[0][rank]),
+                "chunk_text": full_chunk
             })
 
         context = "\n\n".join(retrieved_texts)
@@ -315,18 +320,10 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
                 messages.append(msg)
         messages.append({
             "role": "user",
-            "content": f"Context from academic papers:\n\n{context}\n\nQuestion: {query}\n\nPlease provide a comprehensive answer based on the context above. Keep formatting minimal (no headings/tables): use plain paragraphs, bullet points where helpful, and bold/italics only. If you include math, use LaTeX with \\(inline\\) or \\[display\\] delimiters, not code fences."
+            "content": f"Context from academic papers:\n\n{context}\n\nQuestion: {query}\n\nPlease provide a comprehensive answer based on the context above. Keep formatting minimal (no headings/tables): use plain paragraphs, bullet points where helpful, and bold/italics only."
         })
 
-        if debug:
-            print("\n" + "=" * 80)
-            print("STREAMING: Sending messages to GPT")
-            print("=" * 80)
-            for i, msg in enumerate(messages, 1):
-                print(f"\n--- Message {i} ({msg['role']}) ---")
-                print(msg['content'])
-                print(f"--- End of Message {i} ---\n")
-
+        # Start streaming from OpenAI
         stream = _openai_client.chat.completions.create(
             model=MODEL_ID,
             messages=messages,
@@ -335,16 +332,31 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
             stream=True,
         )
 
-        # Stream deltas
+        # Accumulate deltas
+        full_answer_text = ""
+
         for event in stream:
             try:
                 delta = event.choices[0].delta.content
             except Exception:
                 delta = None
             if delta:
+                full_answer_text += delta
                 yield f"data: {json.dumps({'event': 'delta', 'text': delta})}\n\n"
 
-        # Emit final sources
-        yield f"data: {json.dumps({'event': 'done', 'sources': sources})}\n\n"
+        # Compute alignments once done
+        from semantic_alignment import align_paragraphs_to_retrieved_chunks
+
+        paragraph_alignments = align_paragraphs_to_retrieved_chunks(
+            answer_text=full_answer_text,
+            embed_model=_embed_model,
+            retrieved_chunks=sources,
+            top_k=1,
+            threshold=0.25
+        )
+
+        # Send both sources and alignments
+        yield f"data: {json.dumps({'event': 'done', 'sources': sources, 'paragraph_alignments': paragraph_alignments})}\n\n"
+
     except Exception as e:
         yield f"data: {json.dumps({'event': 'error', 'message': str(e)})}\n\n"

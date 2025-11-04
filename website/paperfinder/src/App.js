@@ -1,16 +1,28 @@
 import React, { useState, useEffect } from "react";
-import axios from "axios";
 
 function App() {
   // State for managing multiple conversations
   const [conversations, setConversations] = useState([
-    { id: 1, name: "New Chat", messages: [{ role: "bot", message: "Hi! I'm your research assistant. Ask me about any topic.", sources: [] }], loading: false }
+    {
+      id: 1,
+      name: "New Chat",
+      messages: [
+        {
+          role: "bot",
+          message: "Hi! I'm your research assistant. Ask me about any topic.",
+          sources: [],
+        },
+      ],
+      loading: false,
+    },
   ]);
   const [activeConversationId, setActiveConversationId] = useState(1);
   const [query, setQuery] = useState("");
+  const [selectedSource, setSelectedSource] = useState(null); // 👈 for side modal popup
 
   // Get current conversation
-  const activeConversation = conversations.find(c => c.id === activeConversationId) || conversations[0];
+  const activeConversation =
+    conversations.find((c) => c.id === activeConversationId) || conversations[0];
   const messages = activeConversation.messages;
 
   // Typeset LaTeX after messages render/update
@@ -29,12 +41,18 @@ function App() {
 
   // Create new conversation
   const createNewConversation = () => {
-    const newId = Math.max(...conversations.map(c => c.id), 0) + 1;
+    const newId = Math.max(...conversations.map((c) => c.id), 0) + 1;
     const newConversation = {
       id: newId,
       name: `Chat ${newId}`,
-      messages: [{ role: "bot", message: "Hi! I'm your research assistant. Ask me about any topic.", sources: [] }],
-      loading: false
+      messages: [
+        {
+          role: "bot",
+          message: "Hi! I'm your research assistant. Ask me about any topic.",
+          sources: [],
+        },
+      ],
+      loading: false,
     };
     setConversations([...conversations, newConversation]);
     setActiveConversationId(newId);
@@ -42,69 +60,95 @@ function App() {
 
   // Delete conversation
   const deleteConversation = (id, e) => {
-    e.stopPropagation(); // Prevent tab switching
-    if (conversations.length === 1) return; // Don't delete the last conversation
-    
-    const filtered = conversations.filter(c => c.id !== id);
+    e.stopPropagation();
+    if (conversations.length === 1) return;
+    const filtered = conversations.filter((c) => c.id !== id);
     setConversations(filtered);
-    
-    // If deleted conversation was active, switch to first available
     if (id === activeConversationId) {
       setActiveConversationId(filtered[0].id);
     }
   };
 
-  // Update conversation name based on first user message
+  // Update conversation name
   const updateConversationName = (conversationId, newName) => {
-    setConversations(convs => 
-      convs.map(c => c.id === conversationId ? { ...c, name: newName } : c)
+    setConversations((convs) =>
+      convs.map((c) =>
+        c.id === conversationId ? { ...c, name: newName } : c
+      )
     );
   };
 
+  // Handle sending a query
   const handleSend = async () => {
     if (!query.trim()) return;
     const userMessage = { role: "user", message: query, sources: [] };
     const currentQuery = query;
-    
-    // Update conversation with user message
+    let finalAlignments = [];
+    let finalSources = [];
     const updatedMessages = [...messages, userMessage];
-    setConversations(convs =>
-      convs.map(c => c.id === activeConversationId ? { ...c, messages: updatedMessages } : c)
+    setConversations((convs) =>
+      convs.map((c) =>
+        c.id === activeConversationId
+          ? { ...c, messages: updatedMessages }
+          : c
+      )
     );
-    
-    // Update conversation name if it's still default
-    if (activeConversation.name === "New Chat" || activeConversation.name.startsWith("Chat ")) {
-      const newName = currentQuery.length > 30 ? currentQuery.substring(0, 30) + "..." : currentQuery;
+
+    if (
+      activeConversation.name === "New Chat" ||
+      activeConversation.name.startsWith("Chat ")
+    ) {
+      const newName =
+        currentQuery.length > 30
+          ? currentQuery.substring(0, 30) + "..."
+          : currentQuery;
       updateConversationName(activeConversationId, newName);
     }
-    
+
     setQuery("");
-    
-    // Set loading state for this conversation
-    setConversations(convs =>
-      convs.map(c => c.id === activeConversationId ? { ...c, loading: true } : c)
+
+    setConversations((convs) =>
+      convs.map((c) =>
+        c.id === activeConversationId ? { ...c, loading: true } : c
+      )
     );
 
     try {
-      // Build conversation history from previous messages (excluding the greeting)
       const conversationHistory = updatedMessages
-        .filter(msg => msg.role !== "bot" || msg.message !== "Hi! I'm your research assistant. Ask me about any topic.")
+        .filter(
+          (msg) =>
+            msg.role !== "bot" ||
+            msg.message !==
+              "Hi! I'm your research assistant. Ask me about any topic."
+        )
         .slice(-6)
-        .map(msg => ({
+        .map((msg) => ({
           role: msg.role === "bot" ? "assistant" : "user",
-          content: msg.message
+          content: msg.message,
         }));
-      
-      // Insert a placeholder bot message we will update progressively
-      const placeholderIndex = updatedMessages.length; // next index
-      setConversations(convs =>
-        convs.map(c => c.id === activeConversationId ? { ...c, messages: [...updatedMessages, { role: "bot", message: "", sources: [] }] } : c)
+
+      const placeholderIndex = updatedMessages.length;
+      setConversations((convs) =>
+        convs.map((c) =>
+          c.id === activeConversationId
+            ? {
+                ...c,
+                messages: [
+                  ...updatedMessages,
+                  { role: "bot", message: "", sources: [] },
+                ],
+              }
+            : c
+        )
       );
 
       const res = await fetch("http://127.0.0.1:5000/api/chat_stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: currentQuery, conversation_history: conversationHistory }),
+        body: JSON.stringify({
+          message: currentQuery,
+          conversation_history: conversationHistory,
+        }),
       });
 
       if (!res.body) throw new Error("No response body");
@@ -112,29 +156,42 @@ function App() {
       const decoder = new TextDecoder("utf-8");
       let buffer = "";
       let fullText = "";
-      let finalSources = [];
 
       const processBuffer = (buf) => {
         const lines = buf.split("\n\n");
+      
+
+
         for (let i = 0; i < lines.length - 1; i++) {
           const line = lines[i].trim();
           if (line.startsWith("data: ")) {
-            try {
-              const payload = JSON.parse(line.slice(6));
-              if (payload.event === "delta" && payload.text) {
-                fullText += payload.text;
-                // Update the last bot message progressively
-                setConversations(convs => convs.map(c => {
-                  if (c.id !== activeConversationId) return c;
-                  const newMessages = [...c.messages];
-                  newMessages[placeholderIndex] = { role: "bot", message: fullText, sources: [] };
-                  return { ...c, messages: newMessages };
-                }));
-              } else if (payload.event === "done") {
-                finalSources = payload.sources || [];
-              }
-            } catch {}
-          }
+  try {
+    const payload = JSON.parse(line.slice(6));
+    if (payload.event === "delta" && payload.text) {
+      fullText += payload.text;
+      setConversations((convs) =>
+        convs.map((c) => {
+          if (c.id !== activeConversationId) return c;
+          const newMessages = [...c.messages];
+          newMessages[placeholderIndex] = {
+            role: "bot",
+            message: fullText,
+            sources: [],
+          };
+          return { ...c, messages: newMessages };
+        })
+      );
+    } else if (payload.event === "done") {
+      console.log("✅ Final payload received:", payload);
+      finalSources = payload.sources || [];
+      finalAlignments = payload.paragraph_alignments || [];
+    }
+  } catch (err) {
+    console.error("Parse error:", err);
+  }
+  
+}
+
         }
         return lines[lines.length - 1];
       };
@@ -145,23 +202,40 @@ function App() {
         buffer += decoder.decode(value, { stream: true });
         buffer = processBuffer(buffer);
       }
-      // Flush remaining buffer
+
       if (buffer) buffer = processBuffer(buffer + "\n\n");
 
-      // Finalize: set sources and clear loading
-      setConversations(convs =>
-        convs.map(c => {
+      setConversations((convs) =>
+        convs.map((c) => {
           if (c.id !== activeConversationId) return c;
           const newMessages = [...c.messages];
-          newMessages[placeholderIndex] = { role: "bot", message: fullText, sources: finalSources };
+          newMessages[placeholderIndex] = {
+          role: "bot",
+          message: fullText,
+          sources: finalSources,
+          alignments: finalAlignments,
+          };
+
           return { ...c, messages: newMessages, loading: false };
         })
       );
     } catch (err) {
-      const errorMessage = { role: "bot", message: "⚠️ Backend not reachable. Make sure Flask is running.", sources: [] };
-      // Update conversation with error message and remove loading state
-      setConversations(convs =>
-        convs.map(c => c.id === activeConversationId ? { ...c, messages: [...updatedMessages, errorMessage], loading: false } : c)
+      const errorMessage = {
+        role: "bot",
+        message:
+          "⚠️ Backend not reachable. Make sure Flask is running.",
+        sources: [],
+      };
+      setConversations((convs) =>
+        convs.map((c) =>
+          c.id === activeConversationId
+            ? {
+                ...c,
+                messages: [...updatedMessages, errorMessage],
+                loading: false,
+              }
+            : c
+        )
       );
     }
   };
@@ -178,15 +252,17 @@ function App() {
         <p style={styles.subtitle}>Your AI-powered research assistant</p>
       </header>
 
-      {/* Conversation Tabs */}
+      {/* Tabs */}
       <div style={styles.tabsContainer}>
         <div style={styles.tabs}>
-          {conversations.map(conv => (
+          {conversations.map((conv) => (
             <div
               key={conv.id}
               style={{
                 ...styles.tab,
-                ...(conv.id === activeConversationId ? styles.tabActive : {})
+                ...(conv.id === activeConversationId
+                  ? styles.tabActive
+                  : {}),
               }}
               onClick={() => setActiveConversationId(conv.id)}
             >
@@ -195,17 +271,10 @@ function App() {
                 <button
                   style={{
                     ...styles.tabClose,
-                    color: conv.id === activeConversationId ? "white" : "#666",
-                  }}
-                  onMouseEnter={(e) => {
-                    if (conv.id === activeConversationId) {
-                      e.target.style.backgroundColor = "rgba(255,255,255,0.2)";
-                    } else {
-                      e.target.style.backgroundColor = "#e0e0e0";
-                    }
-                  }}
-                  onMouseLeave={(e) => {
-                    e.target.style.backgroundColor = "transparent";
+                    color:
+                      conv.id === activeConversationId
+                        ? "white"
+                        : "#666",
                   }}
                   onClick={(e) => deleteConversation(conv.id, e)}
                   title="Delete conversation"
@@ -218,43 +287,80 @@ function App() {
           <button
             style={styles.newChatButton}
             onClick={createNewConversation}
-            title="New Chat"
           >
             + New
           </button>
         </div>
       </div>
 
-      {/* Chat Window */}
+      {/* Chat */}
       <div style={styles.chatBox}>
         {messages.map((m, i) => (
           <div
             key={i}
             style={{
               ...styles.message,
-              alignSelf: m.role === "user" ? "flex-end" : "flex-start",
-              backgroundColor: m.role === "user" ? "#d7f3eb" : "#f4f9f7",
+              alignSelf:
+                m.role === "user" ? "flex-end" : "flex-start",
+              backgroundColor:
+                m.role === "user" ? "#d7f3eb" : "#f4f9f7",
             }}
           >
-            {/* Main message content (simple formatting only) */}
-            <p
-              style={styles.text}
-              dangerouslySetInnerHTML={{
-                __html: m.message
-                  .replace(/\*\*(.*?)\*\*/g, "<b>$1</b>")
-                  .replace(/\*(.*?)\*/g, "<i>$1</i>")
-                  .replace(/\n/g, "<br/>")
-              }}
-            />
-            
-            {/* Sources section */}
+            {/* Paragraphs with side "?" */}
+            <div style={styles.paragraphContainer}>
+              {m.message
+                .split(/\n\s*\n/)
+                .map((para, pIdx) => (
+                  <div key={pIdx} style={styles.paragraphWrapper}>
+                    <p
+                      style={styles.text}
+                      dangerouslySetInnerHTML={{
+                        __html: para
+                          .replace(/\*\*(.*?)\*\*/g, "<b>$1</b>")
+                          .replace(/\*(.*?)\*/g, "<i>$1</i>")
+                          .replace(/\n/g, "<br/>"),
+                      }}
+                    />
+                    {m.alignments &&
+  m.alignments
+    .filter((a) => {
+  if (!a.paragraph || !para) return false;
+  const paraStart = a.paragraph.slice(0, 40).toLowerCase();
+  return para.toLowerCase().includes(paraStart);
+})
+    .slice(0, 1)
+    .map((a, idx) => (
+      <button
+        key={idx}
+        style={styles.sideSourceBox}
+        onClick={() => setSelectedSource(a)}
+        title="View source"
+      >
+        ?
+      </button>
+    ))}
+
+                  </div>
+                ))}
+            </div>
+
+            {/* Bottom Sources */}
             {m.sources && m.sources.length > 0 && (
               <div style={styles.sources}>
                 <div style={styles.sourcesTitle}>📚 Sources:</div>
                 {m.sources.map((source, idx) => (
-                  <div key={idx} style={styles.sourceItem}>
+                  <div
+                    key={idx}
+                    style={{
+                      ...styles.sourceItem,
+                      cursor: "pointer",
+                    }}
+                    onClick={() => setSelectedSource(source)}
+                  >
                     <span style={styles.sourceNumber}>{idx + 1}.</span>
-                    <span style={styles.sourceId}>[{source.paper_id}]</span>
+                    <span style={styles.sourceId}>
+                      [{source.paper_id}]
+                    </span>
                     <span style={styles.sourceTitle}>{source.title}</span>
                   </div>
                 ))}
@@ -262,12 +368,42 @@ function App() {
             )}
           </div>
         ))}
-        {activeConversation.loading && !(messages.length > 0 && messages[messages.length - 1].role === "bot") && (
-          <div style={{ ...styles.message, backgroundColor: "#f4f9f7" }}>
-            <p style={styles.text}>Searching for papers...</p>
-          </div>
-        )}
       </div>
+
+      {/* Modal for source details */}
+      {selectedSource && (
+        <div
+          style={styles.modalOverlay}
+          onClick={() => setSelectedSource(null)}
+        >
+          <div
+            style={styles.modal}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={styles.modalTitle}>
+              [{selectedSource.paper_id}] {selectedSource.title}
+            </h3>
+            {selectedSource.similarity !== undefined && (
+            <p style={{ marginTop: "-0.3rem", color: "#555" }}>
+              <b>Similarity:</b> {(selectedSource.similarity * 100).toFixed(1)}%
+            </p>
+            )}
+
+            {selectedSource.authors && selectedSource.authors.length > 0 && (
+              <p style={styles.modalAuthors}>
+                {selectedSource.authors.join(", ")}
+              </p>
+            )}
+            <p style={styles.modalChunk}>{selectedSource.chunk_text}</p>
+            <button
+              style={styles.modalClose}
+              onClick={() => setSelectedSource(null)}
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Input bar */}
       <div style={styles.inputBar}>
@@ -283,7 +419,10 @@ function App() {
         <button
           onClick={handleSend}
           disabled={activeConversation.loading}
-          style={{ ...styles.button, opacity: activeConversation.loading ? 0.7 : 1 }}
+          style={{
+            ...styles.button,
+            opacity: activeConversation.loading ? 0.7 : 1,
+          }}
         >
           {activeConversation.loading ? "..." : "Send"}
         </button>
@@ -302,24 +441,13 @@ const styles = {
     alignItems: "center",
     padding: "1.2rem",
   },
-  header: {
-    textAlign: "center",
-    marginBottom: "1rem",
-  },
-  title: {
-    color: "#156f63",
-    fontSize: "2rem",
-    marginBottom: "0.3rem",
-  },
-  subtitle: {
-    color: "#285c54",
-    fontSize: "1rem",
-    marginTop: 0,
-  },
+  header: { textAlign: "center", marginBottom: "1rem" },
+  title: { color: "#156f63", fontSize: "2rem", marginBottom: "0.3rem" },
+  subtitle: { color: "#285c54", fontSize: "1rem", marginTop: 0 },
   chatBox: {
     flex: 1,
     width: "100%",
-    maxWidth: "650px", // 🔹 narrower than before
+    maxWidth: "650px",
     backgroundColor: "#ffffff",
     borderRadius: "12px",
     padding: "1rem",
@@ -336,10 +464,7 @@ const styles = {
     lineHeight: 1.5,
     wordBreak: "break-word",
   },
-  text: {
-    margin: 0,
-    whiteSpace: "pre-wrap",
-  },
+  text: { margin: 0, whiteSpace: "pre-wrap" },
   inputBar: {
     display: "flex",
     width: "100%",
@@ -379,22 +504,15 @@ const styles = {
     fontSize: "0.9rem",
     color: "#333",
     lineHeight: "1.4",
-    display: "block",
   },
-  sourceNumber: {
-    fontWeight: "bold",
-    color: "#1c776a",
-    marginRight: "0.4rem",
-  },
+  sourceNumber: { fontWeight: "bold", color: "#1c776a", marginRight: "0.4rem" },
   sourceId: {
     fontWeight: "bold",
     color: "#1c776a",
     marginRight: "0.5rem",
     whiteSpace: "nowrap",
   },
-  sourceTitle: {
-    color: "#555",
-  },
+  sourceTitle: { color: "#555" },
   tabsContainer: {
     width: "100%",
     maxWidth: "650px",
@@ -405,7 +523,6 @@ const styles = {
     gap: "0.5rem",
     overflowX: "auto",
     paddingBottom: "0.5rem",
-    scrollbarWidth: "thin",
   },
   tab: {
     display: "flex",
@@ -416,14 +533,8 @@ const styles = {
     backgroundColor: "#ffffff",
     border: "2px solid #e0e0e0",
     cursor: "pointer",
-    whiteSpace: "nowrap",
-    transition: "all 0.2s",
   },
-  tabActive: {
-    backgroundColor: "#1c776a",
-    borderColor: "#1c776a",
-    color: "white",
-  },
+  tabActive: { backgroundColor: "#1c776a", borderColor: "#1c776a", color: "white" },
   tabName: {
     fontSize: "0.9rem",
     maxWidth: "150px",
@@ -436,14 +547,7 @@ const styles = {
     cursor: "pointer",
     fontSize: "1.2rem",
     lineHeight: "1",
-    padding: "0",
-    width: "18px",
-    height: "18px",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    borderRadius: "50%",
-    transition: "background-color 0.2s",
+    padding: 0,
   },
   newChatButton: {
     padding: "0.5rem 1rem",
@@ -453,9 +557,79 @@ const styles = {
     color: "#1c776a",
     fontWeight: "bold",
     cursor: "pointer",
-    whiteSpace: "nowrap",
-    transition: "all 0.2s",
+  },
+  paragraphContainer: {
+    position: "relative",
+    display: "flex",
+    flexDirection: "column",
+    gap: "1rem",
+  },
+  paragraphWrapper: { position: "relative", paddingRight: "2rem" },
+  sideSourceBox: {
+    position: "absolute",
+    right: "-1.5rem",
+    top: "0.3rem",
+    width: "1.2rem",
+    height: "1.2rem",
+    borderRadius: "50%",
+    backgroundColor: "#1c776a",
+    color: "white",
+    border: "none",
+    fontWeight: "bold",
+    cursor: "pointer",
+    boxShadow: "0 2px 6px rgba(0,0,0,0.2)",
+  },
+  modalOverlay: {
+    position: "fixed",
+    top: 0,
+    left: 0,
+    width: "100vw",
+    height: "100vh",
+    backgroundColor: "rgba(0,0,0,0.4)",
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+    zIndex: 1000,
+  },
+  modal: {
+    backgroundColor: "#fff",
+    padding: "1.5rem",
+    borderRadius: "10px",
+    width: "90%",
+    maxWidth: "600px",
+    boxShadow: "0 4px 15px rgba(0,0,0,0.2)",
+    overflowY: "auto",
+    maxHeight: "80vh",
+  },
+  modalTitle: {
+    fontSize: "1.2rem",
+    fontWeight: "bold",
+    color: "#1c776a",
+    marginBottom: "0.5rem",
+  },
+    modalAuthors: {
+    fontStyle: "italic",
+    color: "#444",
+    marginBottom: "1rem",
+  },
+  modalChunk: {
+    whiteSpace: "pre-wrap",
+    lineHeight: 1.5,
+    color: "#222",
+    fontSize: "0.95rem",
+  },
+  modalClose: {
+    marginTop: "1rem",
+    border: "none",
+    borderRadius: "6px",
+    backgroundColor: "#1c776a",
+    color: "white",
+    fontWeight: "bold",
+    padding: "0.6rem 1.2rem",
+    cursor: "pointer",
+    alignSelf: "flex-end",
   },
 };
 
 export default App;
+
