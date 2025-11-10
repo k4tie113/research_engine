@@ -5,16 +5,25 @@ check_es_data.py
 Check what data is actually in Elasticsearch for a sample document.
 """
 
+import os
 from elasticsearch import Elasticsearch
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # === ELASTICSEARCH CONFIG ===
-ES_URL = "https://my-elasticsearch-project-fb6996.es.us-central1.gcp.elastic.cloud"
-ES_API_KEY = "***REMOVED***"
+ES_URL = os.getenv("ES_URL", "https://my-elasticsearch-project-fb6996.es.us-central1.gcp.elastic.cloud")
+ES_API_KEY = os.getenv("ES_API_KEY")
 ES_INDEX = "paper_chunks"
 
 def check_sample_data():
     """Check a sample document from Elasticsearch to see what fields are available."""
     try:
+        if not ES_API_KEY:
+            print("[ERROR] ES_API_KEY not found in environment variables. Please set it in .env file.")
+            return
+        
         es = Elasticsearch(
             [ES_URL],
             api_key=ES_API_KEY,
