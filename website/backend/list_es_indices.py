@@ -5,15 +5,24 @@ list_es_indices.py
 Simple script to list all indices in your Elasticsearch cluster.
 """
 
+import os
 from elasticsearch import Elasticsearch
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # === ELASTICSEARCH CONFIG ===
-ES_URL = "https://my-elasticsearch-project-fb6996.es.us-central1.gcp.elastic.cloud"
-ES_API_KEY = "***REMOVED***"
+ES_URL = os.getenv("ES_URL", "https://my-elasticsearch-project-fb6996.es.us-central1.gcp.elastic.cloud")
+ES_API_KEY = os.getenv("ES_API_KEY")
 
 def list_indices():
     """List all indices in the Elasticsearch cluster."""
     try:
+        if not ES_API_KEY:
+            print("[ERROR] ES_API_KEY not found in environment variables. Please set it in .env file.")
+            return
+        
         # Initialize Elasticsearch client
         es = Elasticsearch(
             [ES_URL],
