@@ -253,9 +253,18 @@ function App() {
                 <div style={styles.sourcesTitle}>📚 Sources:</div>
                 {m.sources.map((source, idx) => (
                   <div key={idx} style={styles.sourceItem}>
-                    <span style={styles.sourceNumber}>{idx + 1}.</span>
+                    <span style={styles.sourceNumber}>{source.rank || idx + 1}.</span>
                     <span style={styles.sourceId}>[{source.paper_id}]</span>
-                    <span style={styles.sourceTitle}>{source.title}</span>
+                    {source.url ? (
+                      <a href={source.url} target="_blank" rel="noopener noreferrer" style={{...styles.sourceTitle, color: "#1c776a", textDecoration: "underline"}}>
+                        {source.title}
+                      </a>
+                    ) : (
+                      <span style={styles.sourceTitle}>{source.title}</span>
+                    )}
+                    {source.authors && (
+                      <span style={styles.sourceAuthors}> - {source.authors}</span>
+                    )}
                   </div>
                 ))}
               </div>
@@ -394,6 +403,11 @@ const styles = {
   },
   sourceTitle: {
     color: "#555",
+  },
+  sourceAuthors: {
+    color: "#777",
+    fontSize: "0.85rem",
+    fontStyle: "italic",
   },
   tabsContainer: {
     width: "100%",
