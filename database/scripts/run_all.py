@@ -43,9 +43,8 @@ def run_script(script_name: str):
         If the script returns a non-zero exit code.
     """
     print(f"\n=== Running {script_name} ===")
-    # Use subprocess.run so that output is streamed directly to the console.
-    # Use the same Python interpreter that's running this script (e.g., your venv)
-    subprocess.run([sys.executable, str(SCRIPT_DIR / script_name)], check=True)
+    parts = script_name.split()
+    subprocess.run([sys.executable, str(SCRIPT_DIR / parts[0]), *parts[1:]], check=True)
 
 def main():
     """
@@ -53,7 +52,7 @@ def main():
     If any stage fails, the script stops and prints the error.
     """
     # Use only scripts that live in this directory
-    run_script("fetch_oai.py")        # Step 1: fetch metadata
+    run_script("fetch_oai.py 2023")        # Step 1: fetch metadata
     run_script("download_oai.py")     # Step 2: download PDFs
     run_script("chunk_pdfs_oai.py")   # Step 3: chunk PDFs to JSONL
 
