@@ -55,10 +55,16 @@ def _combine_call(inp: CombineAnchorInput) -> CombineAnchorOutput:
     user = _COMBINE_PROMPT.replace("{{query}}", inp["query"]).replace("{{anchors_markdown}}", inp["anchors_markdown"])
     return _chat_json(sys, user, CombineAnchorOutput, max_tokens=800)
 
+# file: website/backend/query_analyzer/anchor.py
+
 def combine_content_query_with_anchors(content_query: str, anchor_docs: Iterable[str] | None) -> str:
     """
     anchor_docs: iterable of markdown strings (or objects with .markdown attr).
     """
+    # >>> add this guard right at the top <<<
+    if not os.getenv("OPENAI_API_KEY"):
+        return content_query  # true no-op when no key
+
     try:
         if not anchor_docs:
             return content_query
@@ -74,3 +80,4 @@ def combine_content_query_with_anchors(content_query: str, anchor_docs: Iterable
     except Exception as e:
         logger.exception(f"Failed to combine query with anchors: {e}")
         return content_query
+
