@@ -1,9 +1,6 @@
-#test_query_analyzer_prompts.py
-
 import pytest
 from pydantic import ValidationError
-
-from mabool.agents.query_analyzer.query_analyzer_prompts import IdentifyRelevanceCriteriaOutput, RelevanceCriterion
+from query_analyzer_prompts import IdentifyRelevanceCriteriaOutput, RelevanceCriterion
 
 
 def test_identify_relevance_criteria_output_valid() -> None:
