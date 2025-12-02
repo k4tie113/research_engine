@@ -20,14 +20,18 @@ __pycache__/
 data/
 *.pdf
 *.txt
+*.csv
 
 # Large chunk files (do NOT commit)
 elasticsearch/chunks.jsonl
 elasticsearch/embedded_chunks.jsonl
 elasticsearch/embedded_*.jsonl
+elasticsearch/papers_oai_combined.csv
+
 
 # Any massive .jsonl files that should not be versioned
 *.jsonl
+
 
 # ---------------------------------------
 # Elastic local installation (auto-generated)
