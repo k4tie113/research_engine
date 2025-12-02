@@ -1,14 +1,45 @@
+# ---------------------------------------
+# Python environments
+# ---------------------------------------
+
 venv/
+*/venv/
+
+# Bytecode cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment files
+.env
+
+# ---------------------------------------
+# Data directories
+# ---------------------------------------
+
 data/
 *.pdf
 *.txt
 
-.env
+# Large chunk files (do NOT commit)
+elasticsearch/chunks.jsonl
+elasticsearch/embedded_chunks.jsonl
+elasticsearch/embedded_*.jsonl
 
+# Any massive .jsonl files that should not be versioned
+*.jsonl
 
-.env
+# ---------------------------------------
+# Elastic local installation (auto-generated)
+# ---------------------------------------
 
+elasticsearch/elastic-start-local/
 
-__pycache__/
-*.pyc
+# ---------------------------------------
+# Optional: OS/editor junk
+# ---------------------------------------
 
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
