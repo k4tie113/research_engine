@@ -47,3 +47,7 @@ elasticsearch/elastic-start-local/
 Thumbs.db
 .vscode/
 .idea/
+
+__pycache__/
+*.pyc
+
