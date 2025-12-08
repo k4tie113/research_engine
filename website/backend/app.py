@@ -1,11 +1,13 @@
 from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
+import sys
+from pathlib import Path
 
 # Add the retrieval directory to the path
 sys.path.append(str(Path(__file__).resolve().parents[2] / "retrieval"))
 
 # Import RAG service from retrieval module
-from rag_service import get_rag_response, format_sources, get_system_status
+from rag_service import get_rag_response, format_sources, get_system_status, stream_rag_response
 from query_analyzer import analyze_query
 
 app = Flask(__name__)
@@ -122,11 +124,10 @@ def api_chat():
             conversation_history=conversation_history
         )
 
-        # Step 4: Format and return response
-        reply = answer + format_sources(sources, max_sources=5)
-        
+        # Step 4: Return response (sources are already included first in answer)
+        # The get_rag_response function now returns sources first, then summary
         return jsonify({
-            "reply": reply, 
+            "reply": answer,  # Already includes sources first
             "analysis": analysis,
             "enhanced_query": enhanced_query
         })
@@ -145,12 +146,13 @@ def chat_stream():
     data = request.get_json()
     message = data.get("message", "").strip()
     conversation_history = data.get("conversation_history", [])
+    filters = data.get("filters", {})
 
     if not message:
         return jsonify({"error": "Please enter a message."}), 400
 
     def generate():
-        yield from stream_rag_response(message, top_k=5, max_tokens=600, debug=True, conversation_history=conversation_history)
+        yield from stream_rag_response(message, top_k=5, max_tokens=600, debug=True, conversation_history=conversation_history, user_filters=filters)
 
     return Response(generate(), mimetype="text/event-stream")
 

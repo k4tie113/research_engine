@@ -130,8 +130,17 @@ class QueryAnalyzer:
         )
 
     def analyze_query(self, user_query: str) -> Dict[str, Any]:
+        print("\n" + "="*60)
+        print("ANALYZE QUERY")
+        print("="*60)
+        print(f"Input Query: '{user_query}'")
+        print(f"Model: {self._model}")
+        
         try:
+            print("\nGetting OpenAI client...")
             client = self._get_client()
+            
+            print("Sending request to OpenAI API...")
             resp = client.chat.completions.create(
                 model=self._model,
                 temperature=0.0,
@@ -141,19 +150,50 @@ class QueryAnalyzer:
                     {"role": "user", "content": user_query},
                 ],
             )
+            
+            print("Received response from OpenAI API")
             raw = resp.choices[0].message.content or "{}"
             if isinstance(raw, list):  # very defensive
                 raw = "".join(str(p) for p in raw)
+            
+            print(f"Raw JSON response length: {len(raw)} characters")
             parsed: Dict[str, Any] = _json.loads(raw)
+            print("Successfully parsed JSON response")
 
+            print("\n" + "-"*60)
+            print("EXTRACTING FIELDS")
+            print("-"*60)
+            
             content = str(parsed.get("content") or "").strip()
+            print(f"Content (raw from API): '{parsed.get('content')}'")
+            print(f"Content (normalized): '{content}'")
+            
             authors = _safe_list(parsed.get("authors"))
+            print(f"Authors (raw from API): {parsed.get('authors')}")
+            print(f"Authors (normalized): {authors}")
+            
             venues = _safe_list(parsed.get("venues"))
-            time_range = _normalize_time_range(parsed.get("time_range"))
+            print(f"Venues (raw from API): {parsed.get('venues')}")
+            print(f"Venues (normalized): {venues}")
+            
+            time_range_raw = parsed.get("time_range")
+            print(f"Time Range (raw from API): {time_range_raw}")
+            time_range = _normalize_time_range(time_range_raw)
+            print(f"Time Range (normalized): {time_range}")
+            
             query_type = _infer_query_type(parsed, user_query)
-            relevance = _normalize_relevance_criteria(parsed.get("relevance_criteria"))
+            print(f"Query Type (raw from API): {parsed.get('query_type')}")
+            print(f"Query Type (inferred): {query_type}")
+            
+            relevance_raw = parsed.get("relevance_criteria")
+            print(f"Relevance Criteria (raw from API): {relevance_raw}")
+            relevance = _normalize_relevance_criteria(relevance_raw)
+            print(f"Relevance Criteria (normalized): {relevance}")
+            
+            specifications = parsed.get("specifications", [])
+            print(f"Specifications: {specifications}")
 
-            return {
+            result = {
                 "status": "success",
                 "content": content,
                 "authors": authors,
@@ -161,12 +201,32 @@ class QueryAnalyzer:
                 "time_range": time_range,
                 "query_type": query_type,
                 "relevance_criteria": relevance,
-                "specifications": parsed.get("specifications", []),  # forward-compat
+                "specifications": specifications,  # forward-compat
                 "original_query": user_query,
             }
+            
+            print("\n" + "-"*60)
+            print("FINAL RESULT")
+            print("-"*60)
+            print(f"Status: {result['status']}")
+            print(f"Original Query: {result['original_query']}")
+            print(f"Extracted Content: {result['content']}")
+            print(f"Query Type: {result['query_type']}")
+            print(f"Authors: {result['authors']}")
+            print(f"Venues: {result['venues']}")
+            print(f"Time Range: {result['time_range']}")
+            print(f"Relevance Criteria: {result['relevance_criteria']}")
+            print(f"Specifications: {result['specifications']}")
+            print("="*60 + "\n")
+            
+            return result
 
         except Exception as e:
-            return {
+            print(f"\nERROR in analyze_query: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            result = {
                 "status": "failure",
                 "error": str(e),
                 "content": user_query,
@@ -178,6 +238,11 @@ class QueryAnalyzer:
                 "specifications": [],
                 "original_query": user_query,
             }
+            
+            print(f"Returning failure result: {result}")
+            print("="*60 + "\n")
+            
+            return result
 
 
 # Singleton instance and sync wrapper
