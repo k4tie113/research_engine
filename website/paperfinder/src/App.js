@@ -1,6 +1,98 @@
 import React, { useState, useEffect } from "react";
 import axios from "axios";
 
+// Component for displaying a source item with relevance summary
+const SourceItem = ({ source, idx, styles }) => {
+  const [showRelevance, setShowRelevance] = useState(false);
+  
+  return (
+    <div style={styles.sourceItem}>
+      <div style={styles.sourceHeader}>
+        <span style={styles.sourceNumber}>{source.rank || idx + 1}.</span>
+        <span style={styles.sourceId}>[{source.paper_id}]</span>
+        {source.url ? (
+          <a href={source.url} target="_blank" rel="noopener noreferrer" style={{...styles.sourceTitle, color: "#1c776a", textDecoration: "underline"}}>
+            {source.title}
+          </a>
+        ) : (
+          <span style={styles.sourceTitle}>{source.title}</span>
+        )}
+      </div>
+      {source.authors && (
+        <AuthorBubbles authors={source.authors} sourceIdx={idx} authorStyles={styles} />
+      )}
+      {source.relevance_summary && (
+        <>
+          <button
+            onClick={() => setShowRelevance(!showRelevance)}
+            style={styles.relevanceButton}
+          >
+            {showRelevance ? "▼" : "▶"} Why is this relevant?
+          </button>
+          {showRelevance && (
+            <div style={styles.relevanceSummary}>
+              {source.relevance_summary}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+};
+
+// Component for displaying authors with overflow handling
+const AuthorBubbles = ({ authors, sourceIdx, authorStyles }) => {
+  const [showAll, setShowAll] = useState(false);
+  
+  if (!authors) return null;
+  
+  // Parse authors - could be string or array
+  let authorList = [];
+  if (Array.isArray(authors)) {
+    authorList = authors;
+  } else if (typeof authors === 'string') {
+    // Split by comma and clean up
+    authorList = authors.split(',').map(a => a.trim()).filter(a => a);
+  }
+  
+  if (authorList.length === 0) return null;
+  
+  const maxVisible = 5;
+  const visibleAuthors = authorList.slice(0, maxVisible);
+  const remainingCount = authorList.length - maxVisible;
+  const hiddenAuthors = authorList.slice(maxVisible);
+  
+  return (
+    <div style={authorStyles.authorBubblesContainer}>
+      {visibleAuthors.map((author, idx) => (
+        <span key={idx} style={authorStyles.authorBubble}>
+          {author}
+        </span>
+      ))}
+      {remainingCount > 0 && (
+        <>
+          <span 
+            style={{...authorStyles.authorBubble, ...authorStyles.authorBubbleMore}}
+            onClick={() => setShowAll(!showAll)}
+            title={`${remainingCount} more authors`}
+          >
+            +{remainingCount}
+          </span>
+          {showAll && (
+            <div style={authorStyles.additionalAuthors}>
+              {hiddenAuthors.map((author, idx) => (
+                <span key={idx} style={authorStyles.authorBubble}>
+                  {author}
+                </span>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+};
+
 function App() {
   // State for managing multiple conversations
   const [conversations, setConversations] = useState([
@@ -15,7 +107,8 @@ function App() {
         yearEnd: null,
         authors: [],
         venues: [],
-        queryType: null
+        queryType: null,
+        fullPaperProcessing: false
       }
     }
   ]);
@@ -55,7 +148,8 @@ function App() {
         yearEnd: null,
         authors: [],
         venues: [],
-        queryType: null
+        queryType: null,
+        fullPaperProcessing: false
       }
     };
     setConversations([...conversations, newConversation]);
@@ -224,7 +318,9 @@ function App() {
         yearEnd: filtersToUse.yearEnd,
         authors: filtersToUse.authors,
         venues: filtersToUse.venues,
-        queryType: filtersToUse.queryType
+        queryType: filtersToUse.queryType,
+        // fullPaperProcessing is a user preference, always use from activeConversation.filters
+        fullPaperProcessing: activeConversation.filters.fullPaperProcessing || false
       };
       
       const res = await fetch("http://127.0.0.1:5000/api/chat_stream", {
@@ -252,18 +348,37 @@ function App() {
           if (line.startsWith("data: ")) {
             try {
               const payload = JSON.parse(line.slice(6));
-              if (payload.event === "delta" && payload.text) {
-                fullText += payload.text;
-                // Update the last bot message progressively
+              if (payload.event === "sources" && payload.sources) {
+                // Sources come first - update immediately
+                finalSources = payload.sources || [];
                 setConversations(convs => convs.map(c => {
                   if (c.id !== activeConversationId) return c;
                   const newMessages = [...c.messages];
-                  newMessages[placeholderIndex] = { role: "bot", message: fullText, sources: [] };
+                  newMessages[placeholderIndex] = { role: "bot", message: fullText, sources: finalSources };
+                  return { ...c, messages: newMessages };
+                }));
+              } else if (payload.event === "delta" && payload.text) {
+                fullText += payload.text;
+                // Update the last bot message progressively (with sources if we have them)
+                setConversations(convs => convs.map(c => {
+                  if (c.id !== activeConversationId) return c;
+                  const newMessages = [...c.messages];
+                  newMessages[placeholderIndex] = { role: "bot", message: fullText, sources: finalSources };
                   return { ...c, messages: newMessages };
                 }));
               } else if (payload.event === "done") {
-                finalSources = payload.sources || [];
+                // Final sources from done event (in case sources event wasn't received)
+                if (payload.sources && payload.sources.length > 0) {
+                  finalSources = payload.sources;
+                }
                 queryAnalysis = payload.analysis || null;
+                // Update message with final sources
+                setConversations(convs => convs.map(c => {
+                  if (c.id !== activeConversationId) return c;
+                  const newMessages = [...c.messages];
+                  newMessages[placeholderIndex] = { role: "bot", message: fullText, sources: finalSources };
+                  return { ...c, messages: newMessages };
+                }));
               }
             } catch {}
           }
@@ -389,19 +504,41 @@ function App() {
               backgroundColor: m.role === "user" ? "#d7f3eb" : "#f4f9f7",
             }}
           >
-            {/* Main message content (simple formatting only) */}
-            <p
-              style={styles.text}
-              dangerouslySetInnerHTML={{
-                __html: m.message
-                  .replace(/\*\*(.*?)\*\*/g, "<b>$1</b>")
-                  .replace(/\*(.*?)\*/g, "<i>$1</i>")
-                  .replace(/\n/g, "<br/>")
-              }}
-            />
+            {/* Sources section - show ABOVE the message for bot messages */}
+            {m.role === "bot" && m.sources && m.sources.length > 0 && (
+              <div style={styles.sources}>
+                <div style={styles.sourcesTitle}>📚 Sources:</div>
+                {m.sources.map((source, idx) => (
+                  <SourceItem 
+                    key={idx} 
+                    source={source} 
+                    idx={idx} 
+                    styles={styles} 
+                  />
+                ))}
+              </div>
+            )}
             
-            {/* Sources section */}
-            {m.sources && m.sources.length > 0 && (
+            {/* Divider between sources and message (only for bot messages with sources) */}
+            {m.role === "bot" && m.sources && m.sources.length > 0 && m.message && (
+              <div style={styles.sourcesDivider}></div>
+            )}
+            
+            {/* Main message content (simple formatting only) */}
+            {m.message && (
+              <p
+                style={styles.text}
+                dangerouslySetInnerHTML={{
+                  __html: m.message
+                    .replace(/\*\*(.*?)\*\*/g, "<b>$1</b>")
+                    .replace(/\*(.*?)\*/g, "<i>$1</i>")
+                    .replace(/\n/g, "<br/>")
+                }}
+              />
+            )}
+            
+            {/* Sources section - show BELOW the message for user messages (if any) */}
+            {m.role === "user" && m.sources && m.sources.length > 0 && (
               <div style={styles.sources}>
                 <div style={styles.sourcesTitle}>📚 Sources:</div>
                 {m.sources.map((source, idx) => (
@@ -577,6 +714,22 @@ function App() {
             </select>
           </div>
 
+          {/* Full Paper Processing */}
+          <div style={styles.filterSection}>
+            <label style={styles.filterLabel}>
+              <input
+                type="checkbox"
+                checked={activeConversation.filters.fullPaperProcessing || false}
+                onChange={(e) => updateFilters({ fullPaperProcessing: e.target.checked })}
+                style={styles.checkboxInput}
+              />
+              Full Paper Processing
+            </label>
+            <div style={styles.filterHelpText}>
+              When enabled, uses ALL chunks from the top 5 papers instead of just the top chunks.
+            </div>
+          </div>
+
           {/* Clear Filters Button */}
           <button
             onClick={() => updateFilters({
@@ -584,7 +737,8 @@ function App() {
               yearEnd: null,
               authors: [],
               venues: [],
-              queryType: null
+              queryType: null,
+              fullPaperProcessing: false
             })}
             style={styles.clearFiltersButton}
           >
@@ -773,40 +927,132 @@ const styles = {
     cursor: "pointer",
   },
   sources: {
-    marginTop: "0.8rem",
-    paddingTop: "0.8rem",
-    borderTop: "1px solid #e0e0e0",
+    marginBottom: "0.8rem",
   },
   sourcesTitle: {
     fontWeight: "bold",
     color: "#285c54",
-    marginBottom: "0.4rem",
+    marginBottom: "0.6rem",
   },
   sourceItem: {
-    marginBottom: "0.4rem",
+    marginBottom: "0.8rem",
     fontSize: "0.9rem",
     color: "#333",
     lineHeight: "1.4",
     display: "block",
   },
+  sourceHeader: {
+    display: "flex",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: "0.4rem",
+    marginBottom: "0.4rem",
+  },
   sourceNumber: {
     fontWeight: "bold",
     color: "#1c776a",
-    marginRight: "0.4rem",
   },
   sourceId: {
     fontWeight: "bold",
     color: "#1c776a",
-    marginRight: "0.5rem",
     whiteSpace: "nowrap",
   },
   sourceTitle: {
     color: "#555",
   },
-  sourceAuthors: {
-    color: "#777",
+  sourcesDivider: {
+    borderTop: "1px solid #e0e0e0",
+    marginTop: "0.8rem",
+    marginBottom: "0.8rem",
+  },
+  authorBubblesContainer: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: "0.4rem",
+    marginTop: "0.3rem",
+    position: "relative",
+  },
+  authorBubble: {
+    display: "inline-block",
+    padding: "0.25rem 0.6rem",
+    backgroundColor: "#e6f2ef",
+    borderRadius: "12px",
+    fontSize: "0.8rem",
+    color: "#1c776a",
+    whiteSpace: "nowrap",
+  },
+  authorBubbleMore: {
+    cursor: "pointer",
+    backgroundColor: "#1c776a",
+    color: "white",
+    fontWeight: "bold",
+  },
+  additionalAuthors: {
+    position: "absolute",
+    top: "100%",
+    left: 0,
+    marginTop: "0.4rem",
+    padding: "0.6rem",
+    backgroundColor: "white",
+    border: "1px solid #e0e0e0",
+    borderRadius: "8px",
+    boxShadow: "0 2px 8px rgba(0,0,0,0.1)",
+    zIndex: 10,
+    display: "flex",
+    flexWrap: "wrap",
+    gap: "0.4rem",
+    minWidth: "200px",
+    maxWidth: "400px",
+  },
+  relevanceButton: {
+    marginTop: "0.5rem",
+    padding: "0.4rem 0.8rem",
+    backgroundColor: "transparent",
+    border: "1px solid #1c776a",
+    borderRadius: "6px",
+    color: "#1c776a",
     fontSize: "0.85rem",
-    fontStyle: "italic",
+    cursor: "pointer",
+    fontWeight: "500",
+    display: "flex",
+    alignItems: "center",
+    gap: "0.3rem",
+    transition: "all 0.2s",
+  },
+  relevanceSummary: {
+    marginTop: "0.5rem",
+    padding: "0.6rem",
+    backgroundColor: "#f4f9f7",
+    borderRadius: "6px",
+    fontSize: "0.85rem",
+    lineHeight: "1.5",
+    color: "#333",
+    borderLeft: "3px solid #1c776a",
+  },
+  relevanceButton: {
+    marginTop: "0.5rem",
+    padding: "0.4rem 0.8rem",
+    backgroundColor: "transparent",
+    border: "1px solid #1c776a",
+    borderRadius: "6px",
+    color: "#1c776a",
+    fontSize: "0.85rem",
+    cursor: "pointer",
+    fontWeight: "500",
+    display: "flex",
+    alignItems: "center",
+    gap: "0.3rem",
+    transition: "all 0.2s",
+  },
+  relevanceSummary: {
+    marginTop: "0.5rem",
+    padding: "0.6rem",
+    backgroundColor: "#f4f9f7",
+    borderRadius: "6px",
+    fontSize: "0.85rem",
+    lineHeight: "1.5",
+    color: "#333",
+    borderLeft: "3px solid #1c776a",
   },
   filterSidebar: {
     backgroundColor: "#ffffff",
@@ -931,6 +1177,16 @@ const styles = {
     outline: "none",
     backgroundColor: "white",
     cursor: "pointer",
+  },
+  checkboxInput: {
+    marginRight: "0.5rem",
+    cursor: "pointer",
+  },
+  filterHelpText: {
+    fontSize: "0.8rem",
+    color: "#666",
+    marginTop: "0.3rem",
+    fontStyle: "italic",
   },
   clearFiltersButton: {
     width: "100%",

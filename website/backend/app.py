@@ -124,11 +124,10 @@ def api_chat():
             conversation_history=conversation_history
         )
 
-        # Step 4: Format and return response
-        reply = answer + format_sources(sources, max_sources=5)
-        
+        # Step 4: Return response (sources are already included first in answer)
+        # The get_rag_response function now returns sources first, then summary
         return jsonify({
-            "reply": reply, 
+            "reply": answer,  # Already includes sources first
             "analysis": analysis,
             "enhanced_query": enhanced_query
         })
