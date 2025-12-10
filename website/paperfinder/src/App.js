@@ -10,6 +10,9 @@ const SourceItem = ({ source, idx, styles }) => {
       <div style={styles.sourceHeader}>
         <span style={styles.sourceNumber}>{source.rank || idx + 1}.</span>
         <span style={styles.sourceId}>[{source.paper_id}]</span>
+        {source.year && (
+        <span style={{ color: "#6a6a6a" }}> ({source.year})</span>
+        )}
         {source.url ? (
           <a href={source.url} target="_blank" rel="noopener noreferrer" style={{...styles.sourceTitle, color: "#1c776a", textDecoration: "underline"}}>
             {source.title}
@@ -157,15 +160,19 @@ function App() {
   };
 
   // Update filters for active conversation
-  const updateFilters = (filterUpdates) => {
+  const updateFilters = (updateFn) => {
     setConversations(convs =>
-      convs.map(c => 
-        c.id === activeConversationId 
-          ? { ...c, filters: { ...c.filters, ...filterUpdates } }
-          : c
-      )
+      convs.map(c => {
+        if (c.id !== activeConversationId) return c;
+        
+        const prev = c.filters;
+        const next = typeof updateFn === "function" ? updateFn(prev) : { ...prev, ...updateFn };
+        
+        return { ...c, filters: next };
+      })
     );
   };
+
 
   // Check if conversation is new (has no user messages yet)
   const isNewConversation = (conv) => {
@@ -312,7 +319,9 @@ function App() {
 
       // Step 2: Send query with current filters
       // Use filters updated from analysis, or fall back to current conversation filters
-      const filtersToUse = updatedFiltersFromAnalysis || activeConversation.filters;
+      const filtersToUse = { ...activeConversation.filters };
+
+
       const filtersPayload = {
         yearStart: filtersToUse.yearStart,
         yearEnd: filtersToUse.yearEnd,
@@ -322,7 +331,9 @@ function App() {
         // fullPaperProcessing is a user preference, always use from activeConversation.filters
         fullPaperProcessing: activeConversation.filters.fullPaperProcessing || false
       };
-      
+
+      console.log("SENDING FILTERS:", filtersToUse);
+
       const res = await fetch("http://127.0.0.1:5000/api/chat_stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -653,9 +664,15 @@ function App() {
                 placeholder="Add author..."
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && e.target.value.trim()) {
-                    updateFilters({
-                      authors: [...activeConversation.filters.authors, e.target.value.trim()]
-                    });
+                    const parts = e.target.value
+                      .split(/[,;]| and /i)  // split on comma, semicolon, or "and"
+                      .map(a => a.trim())
+                      .filter(a => a);
+
+                    updateFilters(prev => ({
+                      ...prev,
+                      authors: [...prev.authors, ...parts]
+                    }));
                     e.target.value = "";
                   }
                 }}
