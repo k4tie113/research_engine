@@ -331,7 +331,7 @@ def _rewrite_query_with_history(query: str, conversation_history: Optional[List[
         return query
 
 
-def get_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int = DEFAULT_MAX_TOKENS, debug: bool = False, conversation_history: List[Dict] = None) -> Tuple[str, List[Dict]]:
+def get_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int = DEFAULT_MAX_TOKENS, debug: bool = False, conversation_history: List[Dict] = None, user_filters: Dict = None) -> Tuple[str, List[Dict]]:
     """
     Get a RAG response for a query with optional conversation history.
     
@@ -363,7 +363,7 @@ def get_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int = D
                         {
                             "multi_match": {
                                 "query": retrieval_query,
-                                "fields": ["chunk_text^3", "title^2", "authors"],
+                                "fields": ["chunk_text^3", "title^2", "authors", "authors.keyword"],
                                 "type": "best_fields",
                                 "fuzziness": "AUTO"
                             }
@@ -371,7 +371,7 @@ def get_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int = D
                         {
                             "multi_match": {
                                 "query": retrieval_query,
-                                "fields": ["chunk_text", "title", "authors"],
+                                "fields": ["chunk_text^3", "title^2", "authors", "authors.keyword"],
                                 "type": "phrase",
                                 "boost": 2.0
                             }
@@ -383,6 +383,37 @@ def get_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int = D
             "size": top_k,
             "_source": ["paper_id", "chunk_index", "title", "authors", "chunk_text", "token_count", "year"]
         }
+
+
+        filters = []
+
+        # AUTHORS FILTER
+        if user_filters and user_filters.get("authors"):
+            filters.append({
+                "terms": {
+                    "authors.keyword": user_filters["authors"]
+                }
+            })
+
+        # YEAR FILTER
+        year_filters = {}
+        if user_filters and user_filters.get("yearStart") is not None:
+            year_filters["gte"] = user_filters["yearStart"]
+        if user_filters and user_filters.get("yearEnd") is not None:
+            year_filters["lte"] = user_filters["yearEnd"]
+
+        if year_filters:
+            filters.append({
+                "range": {
+                    "year": year_filters
+                }
+            })
+
+        # APPLY FILTERS ONLY IF THEY EXIST
+        if filters:
+            search_body["query"]["bool"]["filter"] = filters
+
+
         
         if debug:
             print(f"\n[Retrieval] Searching Elasticsearch with query: {retrieval_query}")
@@ -468,11 +499,13 @@ def get_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int = D
                 "paper_id": paper_id,
                 "title": title if title else f"Paper {paper_id}",
                 "authors": authors if authors else None,
-                "chunk_index": source_data.get("chunk_index", 0),
+                "year": source_data.get("year"),
+                "chunk_index": chunk_index,
                 "rank": rank,
-                "similarity_score": float(hit.get("_score", 0.0)),
+                "similarity_score": chunk_data["score"],
                 "url": arxiv_url
             })
+
         
         if debug:
             print(f"[Retrieval] Retrieved {len(retrieved_texts)} chunks, total context length: {sum(len(t) for t in retrieved_texts)} chars")
@@ -715,7 +748,7 @@ def _search_elasticsearch(query: str, top_k: int = 20, debug: bool = False) -> L
                     {
                         "multi_match": {
                             "query": query,
-                            "fields": ["chunk_text^3", "title^2", "authors"],
+                            "fields": ["chunk_text^3", "title^2", "authors", "authors.keyword"],
                             "type": "best_fields",
                             "fuzziness": "AUTO"
                         }
@@ -723,7 +756,7 @@ def _search_elasticsearch(query: str, top_k: int = 20, debug: bool = False) -> L
                     {
                         "multi_match": {
                             "query": query,
-                            "fields": ["chunk_text", "title", "authors"],
+                            "fields": ["chunk_text^3", "title^2", "authors", "authors.keyword"],
                             "type": "phrase",
                             "boost": 2.0
                         }
@@ -1407,30 +1440,20 @@ def _filter_chunks_by_analysis(all_chunks_dict: Dict, analysis: Dict[str, Any], 
                     should_keep = False
         
         # Filter by authors
+        # AUTHOR FILTER
         if should_keep and has_author_filter:
-            chunk_authors = source_data.get("authors", "")
-            if chunk_authors:
-                # Normalize for comparison (case-insensitive, handle comma-separated)
-                chunk_authors_lower = chunk_authors.lower()
-                requested_authors_lower = [a.lower().strip() for a in requested_authors]
-                
-                # Check if any requested author name is contained in chunk authors
-                author_match = False
-                for req_author in requested_authors_lower:
-                    # Split chunk authors by comma and check each
-                    chunk_author_list = [a.strip() for a in chunk_authors_lower.split(',')]
-                    for chunk_author in chunk_author_list:
-                        # Check if requested author is in chunk author or vice versa
-                        if req_author in chunk_author or chunk_author in req_author:
-                            author_match = True
-                            break
-                    if author_match:
-                        break
-                
-                if not author_match:
-                    should_keep = False
-            else:
-                # No authors in chunk, filter it out if author filter is active
+            chunk_authors = source_data.get("authors", []) or []
+
+            # normalize
+            chunk_authors_lower = [a.lower() for a in chunk_authors]
+            requested_authors_lower = [a.lower() for a in requested_authors]
+
+            author_match = any(
+                any(req in chunk_author for chunk_author in chunk_authors_lower)
+                for req in requested_authors_lower
+            )
+
+            if not author_match:
                 should_keep = False
         
         # Filter by venues (if venue data is available in chunks)
@@ -2038,6 +2061,7 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
                             "paper_id": paper_id,
                             "title": title if title else f"Paper {paper_id}",
                             "authors": authors if authors else None,
+                            "year": source_data.get("year"),
                             "chunk_index": first_chunk_index,
                             "rank": rank_counter,
                             "rrf_score": best_rrf_score,
@@ -2092,6 +2116,7 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
                             "paper_id": paper_id,
                             "title": title if title else f"Paper {paper_id}",
                             "authors": authors if authors else None,
+                            "year": source_data.get("year"),
                             "chunk_index": chunk_index,
                             "rank": rank_counter,
                             "rrf_score": rrf_score,
@@ -2101,9 +2126,12 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
                         rank_counter += 1
         
         # Add arXiv papers as additional chunks (avoid duplicates with existing sources)
+        # When getting papers by author, limit total sources to 5
         seen_paper_ids_from_sources = {s.get("paper_id") for s in sources}
         arxiv_start_rank = len(sources) + 1
-        arxiv_paper_count = min(5, len(arxiv_papers))
+        # Calculate how many arXiv papers we can add to stay within 5 total sources
+        remaining_slots = max(0, 5 - len(sources))
+        arxiv_paper_count = min(remaining_slots, len(arxiv_papers))
         arxiv_added_count = 0
         if len(arxiv_papers) > 0:
             # Update context_chunk_count to include arXiv papers
@@ -2139,6 +2167,7 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
                 "paper_id": paper_id,
                 "title": title if title else f"Paper {paper_id}",
                 "authors": authors if authors else None,
+                "year": arxiv_paper.get("year"),
                 "chunk_index": 0,
                 "rank": arxiv_start_rank + arxiv_added_count,
                 "rrf_score": 0.0,  # arXiv papers don't have RRF scores
@@ -2147,6 +2176,10 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
                 "source": "arxiv_api"
             })
             arxiv_added_count += 1
+            
+            # Limit to top 5 total sources when getting papers by author
+            if len(sources) >= 5:
+                break
         
         context = "\n\n".join(retrieved_texts) if retrieved_texts else "No relevant context found."
         

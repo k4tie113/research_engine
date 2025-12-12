@@ -118,11 +118,13 @@ def api_chat():
 
         # Step 3: Retrieve relevant papers and generate answer
         answer, sources = get_rag_response(
-            enhanced_query, 
+            enhanced_query,
             top_k=5, 
-            debug=True,  # Shows the full prompt sent to GPT
-            conversation_history=conversation_history
+            debug=True,
+            conversation_history=conversation_history,
+            user_filters=data.get("filters", {})
         )
+
 
         # Step 4: Return response (sources are already included first in answer)
         # The get_rag_response function now returns sources first, then summary
