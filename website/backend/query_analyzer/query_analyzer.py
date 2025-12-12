@@ -120,11 +120,15 @@ class QueryAnalyzer:
             '3. "venues": string[] — List of conference/journal venues mentioned (empty if none)\n'
             '4. "time_range": {"start": year|null, "end": year|null} — Only if the query explicitly constrains years\n'
             '5. "query_type": one of ["BROAD_BY_DESCRIPTION","SPECIFIC_BY_TITLE","SPECIFIC_BY_NAME","BY_AUTHOR"]\n'
-            '6. "relevance_criteria": [{"name": str, "description": str, "weight": number}] — content-based; weights sum to 1.0\n\n'
+            '6. "relevance_criteria": [{"name": str, "description": str, "weight": number}] — content-based; weights sum to 1.0\n'
+            '7. "is_off_topic": boolean — Set to true if the query is highly off-topic from the corpus domain\n\n'
+            "Corpus Domain: The training corpus focuses on computer science, natural language processing, and AI/ML topics.\n"
+            "Set is_off_topic to true ONLY if the query is clearly unrelated to CS/NLP/AI/ML (e.g., biology, history, cooking, etc.).\n"
+            "If the query is even tangentially related to CS/NLP/AI/ML, set is_off_topic to false.\n\n"
             "Rules:\n"
             "- Do not infer years unless explicitly requested; if unsure, use nulls.\n"
             "- If the user asks for a specific paper by exact title, use SPECIFIC_BY_TITLE.\n"
-            "- If they say things like “the BERT paper” without exact title, use SPECIFIC_BY_NAME.\n"
+            "- If they say things like \"the BERT paper\" without exact title, use SPECIFIC_BY_NAME.\n"
             "- If authors are provided as filters, you may set BY_AUTHOR.\n"
             "- Keep the response compact and valid JSON only."
         )
@@ -190,6 +194,10 @@ class QueryAnalyzer:
             relevance = _normalize_relevance_criteria(relevance_raw)
             print(f"Relevance Criteria (normalized): {relevance}")
             
+            # Extract is_off_topic flag
+            is_off_topic = bool(parsed.get("is_off_topic", False))
+            print(f"Is Off-Topic: {is_off_topic}")
+            
             specifications = parsed.get("specifications", [])
             print(f"Specifications: {specifications}")
 
@@ -201,6 +209,7 @@ class QueryAnalyzer:
                 "time_range": time_range,
                 "query_type": query_type,
                 "relevance_criteria": relevance,
+                "is_off_topic": is_off_topic,
                 "specifications": specifications,  # forward-compat
                 "original_query": user_query,
             }
@@ -216,6 +225,7 @@ class QueryAnalyzer:
             print(f"Venues: {result['venues']}")
             print(f"Time Range: {result['time_range']}")
             print(f"Relevance Criteria: {result['relevance_criteria']}")
+            print(f"Is Off-Topic: {result['is_off_topic']}")
             print(f"Specifications: {result['specifications']}")
             print("="*60 + "\n")
             
@@ -235,6 +245,7 @@ class QueryAnalyzer:
                 "time_range": {"start": None, "end": None},
                 "query_type": "BROAD_BY_DESCRIPTION",
                 "relevance_criteria": [],
+                "is_off_topic": False,  # Default to false on error
                 "specifications": [],
                 "original_query": user_query,
             }
