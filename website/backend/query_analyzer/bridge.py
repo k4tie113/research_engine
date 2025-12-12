@@ -31,6 +31,7 @@ class QueryAnalyzerBridge:
                     "broad_or_specific": _broad_or_specific(qtype),
                     "specifications": res.get("specifications", []),  # keep key for forward-compat
                     "relevance_criteria": res.get("relevance_criteria", []),
+                    "is_off_topic": res.get("is_off_topic", False),
                     "original_query": res.get("original_query", user_query),
                 }
 

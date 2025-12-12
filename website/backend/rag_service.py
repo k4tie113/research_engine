@@ -23,13 +23,14 @@ load_dotenv()
 
 # === CONFIG ===
 MODEL_ID = "gpt-4o-mini"
+SUMMARIZATION_MODEL_ID = "gpt-4o-mini"  # Use same model as rest of system for consistency
 DEFAULT_TOP_K = 15
 DEFAULT_MAX_TOKENS = 600
 
 # === ELASTICSEARCH CONFIG ===
 ES_URL = os.getenv("ES_URL", "https://my-elasticsearch-project-fb6996.es.us-central1.gcp.elastic.cloud")
 ES_API_KEY = os.getenv("ES_API_KEY")
-ES_INDEX = "paper_chunks"  # Index name in Elasticsearch cluster
+ES_INDEX = "chunks"  # Index name in Elasticsearch cluster
 ES_METADATA_INDEX = None  # Will be discovered dynamically
 
 # Global variables for loaded resources
@@ -752,6 +753,438 @@ def _search_elasticsearch(query: str, top_k: int = 20, debug: bool = False) -> L
     
     hits = response.get("hits", {}).get("hits", [])
     return hits
+def _summarize_paper(full_text: str, target_ratio: float = 0.15, debug: bool = False) -> str:
+    """
+    Summarize a full paper to exactly 500 words as a single paragraph using a lightweight LLM.
+    
+    Args:
+        full_text: The full text of the paper
+        target_ratio: Deprecated - kept for backward compatibility, not used (always targets 500 words)
+        debug: Whether to print debug information
+    
+    Returns:
+        Summarized text as a single paragraph (approximately 500 words)
+    """
+    global _openai_client
+    
+    if not _openai_client:
+        if debug:
+            print("[Summarization] OpenAI client not initialized")
+        return full_text
+    
+    if not full_text or len(full_text) < 200:
+        # Too short to summarize meaningfully
+        return full_text
+    
+    # Fixed target: 500 words (single paragraph)
+    target_word_count = 500
+    
+    # Estimate word count for better prompting
+    word_count = len(full_text.split())
+    
+    if debug:
+        print(f"[Summarization] Original: {word_count} words, Target: {target_word_count} words (single paragraph)")
+    
+    try:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an academic paper summarizer. Create a concise summary as ONE SINGLE PARAGRAPH "
+                    "(one continuous block of text, no line breaks or multiple paragraphs). The summary must be "
+                    f"exactly {target_word_count} words long. Write as a flowing single paragraph that summarizes "
+                    "the key information, main arguments, methodologies, findings, and conclusions. Keep technical "
+                    "terms and important details. Output ONLY the summary text with no additional formatting, headings, "
+                    "bullets, or structure markers. Do NOT use multiple paragraphs - write everything as one continuous paragraph."
+                )
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Summarize the following academic paper in exactly {target_word_count} words as ONE SINGLE PARAGRAPH. "
+                    "Write everything as one continuous block of text with no line breaks or paragraph separations. "
+                    "No headings, bullets, or formatting - just one flowing paragraph summarizing the key content:\n\n"
+                    f"{full_text}"
+                )
+            }
+        ]
+        
+        # Use gpt-4o-mini for summarization (consistent with rest of system)
+        # Calculate max_tokens: roughly 1.5 tokens per word, add buffer for safety
+        estimated_tokens = int(target_word_count * 1.5)  # 1.5 tokens per word with buffer
+        max_tokens = min(4000, max(800, estimated_tokens))  # At least 800 tokens for 500 words, max 4000
+        
+        response = _openai_client.chat.completions.create(
+            model=SUMMARIZATION_MODEL_ID,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.3  # Lower temperature for more consistent summarization
+        )
+        
+        # Extract response content
+        if not response.choices or len(response.choices) == 0:
+            if debug:
+                print(f"[Summarization] ERROR: No choices in response. Response: {response}")
+            return full_text
+        
+        choice = response.choices[0]
+        finish_reason = choice.finish_reason if hasattr(choice, 'finish_reason') else None
+        
+        if debug:
+            print(f"[Summarization] Finish reason: {finish_reason}")
+            print(f"[Summarization] Response object: {response}")
+            print(f"[Summarization] Choice object: {choice}")
+        
+        if not choice.message:
+            if debug:
+                print(f"[Summarization] ERROR: No message in choice. Finish reason: {finish_reason}")
+                print(f"[Summarization] Full response: {response}")
+            return full_text
+        
+        content = choice.message.content
+        if content is None:
+            if debug:
+                print(f"[Summarization] ERROR: Content is None. Finish reason: {finish_reason}")
+                print(f"[Summarization] Full response: {response}")
+                print(f"[Summarization] Message object: {choice.message}")
+            return full_text
+        
+        summarized_text = content.strip() if isinstance(content, str) else str(content).strip()
+        
+        if not summarized_text:
+            if debug:
+                print(f"[Summarization] ERROR: Summarized text is empty after strip. Content was: {repr(content)}")
+                print(f"[Summarization] Finish reason: {finish_reason}")
+            return full_text
+        
+        if debug:
+            summary_word_count = len(summarized_text.split())
+            actual_ratio = summary_word_count / word_count if word_count > 0 else 0
+            print(f"[Summarization] Summary: {summary_word_count} words (target: {target_word_count} words, {actual_ratio*100:.1f}% of original)")
+        
+        return summarized_text
+        
+    except Exception as e:
+        if debug:
+            print(f"[Summarization] Error summarizing paper: {e}")
+            import traceback
+            traceback.print_exc()
+        # Return original text if summarization fails
+        return full_text
+
+
+def _remove_repeated_phrases(text: str, min_phrase_words: int = 10) -> str:
+    """
+    Post-processing step to remove repeated phrases that might have been missed.
+    Looks for phrases of min_phrase_words or more that appear multiple times.
+    
+    Args:
+        text: The text to clean
+        min_phrase_words: Minimum number of words in a phrase to consider for removal
+    
+    Returns:
+        Text with repeated phrases removed
+    """
+    if not text or len(text) < 100:  # Skip if text is too short
+        return text
+    
+    words = text.split()
+    if len(words) < min_phrase_words * 2:  # Need at least 2x the phrase length
+        return text
+    
+    # Look for repeated phrases by checking sequences of words
+    # Start from longer phrases and work down
+    max_phrase_length = min(len(words) // 2, 100)  # Don't check phrases longer than half the text
+    max_iterations = 5  # Limit iterations to avoid infinite loops
+    iteration = 0
+    
+    result_text = text
+    
+    while iteration < max_iterations:
+        iteration += 1
+        found_repeat = False
+        
+        # Check phrases from longest to shortest
+        for phrase_length in range(max_phrase_length, min_phrase_words - 1, -1):
+            # Build a dictionary of phrases and their positions
+            phrase_positions = {}
+            
+            # Check all possible phrases of this length
+            for start_idx in range(len(words) - phrase_length + 1):
+                phrase = words[start_idx:start_idx + phrase_length]
+                phrase_text = ' '.join(phrase)
+                
+                # Skip if phrase is too short (character-wise)
+                if len(phrase_text) < 50:
+                    continue
+                
+                # Find all occurrences of this phrase in the result_text
+                occurrences = []
+                search_start = 0
+                
+                while True:
+                    pos = result_text.find(phrase_text, search_start)
+                    if pos == -1:
+                        break
+                    occurrences.append(pos)
+                    search_start = pos + 1
+                
+                # If we found multiple occurrences, store it
+                if len(occurrences) > 1:
+                    phrase_positions[phrase_text] = sorted(occurrences)
+                    found_repeat = True
+                    break  # Process this phrase first
+        
+        # If we found repeats, remove them
+        if found_repeat and phrase_positions:
+            # Process the first phrase found (longest)
+            phrase_text = list(phrase_positions.keys())[0]
+            occurrences = phrase_positions[phrase_text]
+            
+            # Remove all but the first occurrence (work backwards to maintain positions)
+            for i in range(len(occurrences) - 1, 0, -1):  # Start from last occurrence
+                occ_pos = occurrences[i]
+                # Remove this occurrence
+                before = result_text[:occ_pos]
+                after = result_text[occ_pos + len(phrase_text):]
+                
+                # Clean up any double spaces or awkward breaks
+                before = before.rstrip()
+                after = after.lstrip()
+                
+                # Add a space if needed for smooth flow
+                if before and after:
+                    if before[-1] not in '.!?;:\n' and after[0] not in '.!?;:,':
+                        if not before.endswith(' '):
+                            before += ' '
+                
+                result_text = before + after
+            
+            # Re-split words for next iteration
+            words = result_text.split()
+            if len(words) < min_phrase_words * 2:
+                break
+        else:
+            # No more repeats found
+            break
+    
+    return result_text
+
+
+def _remove_overlap_between_chunks(chunks: List[str], min_overlap_length: int = 50) -> List[str]:
+    """
+    Remove overlapping text between consecutive chunks and ensure smooth flow.
+    Handles cases where chunks overlap at both ends.
+    
+    Args:
+        chunks: List of chunk texts
+        min_overlap_length: Minimum character length of overlap to consider (to avoid false positives)
+    
+    Returns:
+        List of chunks with overlaps removed and smooth transitions
+    """
+    if not chunks or len(chunks) <= 1:
+        return chunks
+    
+    deduplicated = []
+    
+    for i, curr_chunk in enumerate(chunks):
+        if i == 0:
+            # First chunk is always included as-is
+            deduplicated.append(curr_chunk)
+            continue
+        
+        prev_chunk = deduplicated[-1]
+        
+        # Normalize whitespace for comparison, but preserve original for output
+        prev_chunk_clean = prev_chunk.strip()
+        curr_chunk_clean = curr_chunk.strip()
+        
+        if not prev_chunk_clean or not curr_chunk_clean:
+            deduplicated.append(curr_chunk)
+            continue
+        
+        # Find overlap by comparing end of prev_chunk with start of curr_chunk
+        # Use word-boundary matching for accuracy
+        prev_words = prev_chunk_clean.split()
+        curr_words = curr_chunk_clean.split()
+        
+        if not prev_words or not curr_words:
+            deduplicated.append(curr_chunk)
+            continue
+        
+        # Find the longest matching word sequence
+        overlap_found = False
+        overlap_num_words = 0
+        overlap_text = ""
+        
+        # Check from longest possible overlap down to minimum
+        max_possible_words = min(len(prev_words), len(curr_words))
+        # Increase the range - check all possible overlaps, not just those meeting min_overlap_length estimate
+        for num_words in range(max_possible_words, 0, -1):
+            prev_end_words = prev_words[-num_words:]
+            curr_start_words = curr_words[:num_words]
+            
+            # Check if word sequences match exactly
+            if prev_end_words == curr_start_words:
+                overlap_text_words = ' '.join(curr_start_words)
+                # Only consider if it meets minimum length requirement
+                if len(overlap_text_words) >= min_overlap_length:
+                    overlap_found = True
+                    overlap_num_words = num_words
+                    overlap_text = overlap_text_words
+                    break
+        
+        # If word matching didn't work, try character-level matching with increased limits
+        overlap_len_chars = 0
+        if not overlap_found:
+            prev_len = len(prev_chunk_clean)
+            curr_len = len(curr_chunk_clean)
+            # Increase limit significantly - overlaps can be very long
+            max_possible_overlap = min(prev_len, curr_len, 2000)  # Increased from 500 to 2000
+            
+            # Check from end of prev_chunk, with smaller step size for better accuracy
+            # Start from longer overlaps and work backwards
+            for test_len in range(max_possible_overlap, min_overlap_length - 1, -10):  # Step by 10, backwards
+                prev_suffix = prev_chunk_clean[-test_len:]
+                curr_prefix = curr_chunk_clean[:test_len]
+                
+                if prev_suffix == curr_prefix:
+                    overlap_found = True
+                    overlap_len_chars = test_len
+                    overlap_text = prev_suffix
+                    break
+            
+            # If still not found with step size 10, try step size 1 for the last 500 chars
+            if not overlap_found:
+                fine_search_limit = min(500, max_possible_overlap)
+                for test_len in range(fine_search_limit, min_overlap_length - 1, -1):
+                    prev_suffix = prev_chunk_clean[-test_len:]
+                    curr_prefix = curr_chunk_clean[:test_len]
+                    
+                    if prev_suffix == curr_prefix:
+                        overlap_found = True
+                        overlap_len_chars = test_len
+                        overlap_text = prev_suffix
+                        break
+        
+        # Remove overlap and ensure smooth transition
+        if overlap_found:
+            # Find where overlap starts in the original curr_chunk
+            # Try multiple search strategies to handle whitespace differences
+            overlap_pos = -1
+            cut_position = None
+            
+            # First, try exact match
+            overlap_pos = curr_chunk.find(overlap_text)
+            
+            # If not found, try searching in cleaned area
+            if overlap_pos == -1:
+                search_start = max(0, len(curr_chunk) - len(curr_chunk_clean) - 100)
+                overlap_pos = curr_chunk.find(overlap_text, search_start)
+            
+            # If still not found, try normalized version (collapse whitespace)
+            if overlap_pos == -1:
+                overlap_text_normalized = re.sub(r'\s+', ' ', overlap_text).strip()
+                curr_chunk_normalized = re.sub(r'\s+', ' ', curr_chunk).strip()
+                normalized_pos = curr_chunk_normalized.find(overlap_text_normalized)
+                if normalized_pos >= 0:
+                    # Find corresponding position in original
+                    # Count non-whitespace chars up to normalized_pos
+                    char_count = 0
+                    for i, char in enumerate(curr_chunk):
+                        if char not in ' \n\t':
+                            char_count += 1
+                        if char_count > normalized_pos:
+                            overlap_pos = i
+                            break
+            
+            # If still not found but we have word-level match, try finding by first word
+            if overlap_pos == -1 and overlap_num_words > 0:
+                # Find where the first word of overlap appears in curr_chunk
+                first_overlap_word = curr_words[0] if curr_words else ""
+                if first_overlap_word:
+                    # Try to find the word, accounting for word boundaries
+                    word_pos = curr_chunk.find(first_overlap_word)
+                    if word_pos >= 0:
+                        # Verify this is at a word boundary
+                        if word_pos == 0 or curr_chunk[word_pos - 1] in ' \n\t':
+                            overlap_pos = word_pos
+                            # Calculate cut position based on word count
+                            # Find the end of the last overlapping word
+                            words_seen = 1
+                            pos = word_pos + len(first_overlap_word)
+                            while pos < len(curr_chunk) and words_seen < overlap_num_words:
+                                # Skip whitespace
+                                while pos < len(curr_chunk) and curr_chunk[pos] in ' \n\t':
+                                    pos += 1
+                                # Find end of current word
+                                while pos < len(curr_chunk) and curr_chunk[pos] not in ' \n\t':
+                                    pos += 1
+                                words_seen += 1
+                            # Include trailing whitespace
+                            while pos < len(curr_chunk) and curr_chunk[pos] in ' \n\t':
+                                pos += 1
+                            cut_position = pos
+                        else:
+                            # Not at word boundary, try next occurrence
+                            next_word_pos = curr_chunk.find(first_overlap_word, word_pos + 1)
+                            if next_word_pos >= 0 and (next_word_pos == 0 or curr_chunk[next_word_pos - 1] in ' \n\t'):
+                                overlap_pos = next_word_pos
+                                # Similar calculation as above
+                                words_seen = 1
+                                pos = next_word_pos + len(first_overlap_word)
+                                while pos < len(curr_chunk) and words_seen < overlap_num_words:
+                                    while pos < len(curr_chunk) and curr_chunk[pos] in ' \n\t':
+                                        pos += 1
+                                    while pos < len(curr_chunk) and curr_chunk[pos] not in ' \n\t':
+                                        pos += 1
+                                    words_seen += 1
+                                while pos < len(curr_chunk) and curr_chunk[pos] in ' \n\t':
+                                    pos += 1
+                                cut_position = pos
+            
+            if overlap_pos >= 0:
+                # Calculate cut position: after the overlap
+                if cut_position is None:
+                    # Fallback: use length-based calculation
+                    cut_position = overlap_pos + len(overlap_text)
+                
+                # Include any trailing whitespace/newlines after the overlap
+                while cut_position < len(curr_chunk) and curr_chunk[cut_position] in ' \n\t':
+                    cut_position += 1
+                
+                # Get remaining text
+                remaining_text = curr_chunk[cut_position:].strip()
+                
+                if remaining_text:
+                    # Ensure smooth flow by checking spacing
+                    prev_end = prev_chunk.rstrip()
+                    if prev_end and not prev_end[-1] in '.!?;:\n':
+                        # If prev doesn't end with punctuation, ensure proper spacing
+                        if not remaining_text[0] in '.!?;:,' and not prev_end.endswith(' '):
+                            remaining_text = ' ' + remaining_text
+                    
+                    deduplicated.append(remaining_text)
+                # If nothing remains, the chunk was completely overlapped - skip it
+            else:
+                # Couldn't find exact position, append as-is
+                deduplicated.append(curr_chunk)
+        else:
+            # No overlap found, append as-is but ensure smooth transition
+            prev_end = prev_chunk.rstrip()
+            if prev_end and curr_chunk_clean:
+                # Ensure proper spacing between non-overlapping chunks
+                if (prev_end[-1] not in '.!?;:\n' and 
+                    curr_chunk_clean[0] not in '.!?;:,' and
+                    not prev_end.endswith(' ')):
+                    deduplicated.append(' ' + curr_chunk)
+                else:
+                    deduplicated.append(curr_chunk)
+            else:
+                deduplicated.append(curr_chunk)
+    
+    return deduplicated
 
 
 def _get_all_chunks_for_papers(paper_ids: List[str], debug: bool = False) -> Dict[Tuple[str, int], Dict]:
@@ -1169,6 +1602,7 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
 
     try:
         # Step 1: Generate 10 reworded queries using GPT with conversation history
+        yield f"data: {json.dumps({'event': 'status', 'message': 'Generating reformulated queries...'})}\n\n"
         if debug:
             print("\n" + "="*60)
             print("STREAMING: Generating reworded queries")
@@ -1177,6 +1611,7 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
         reworded_queries = _generate_reworded_queries(query, conversation_history, num_queries=10, debug=debug)
         
         # Step 2: For each query, retrieve top 20 chunks from Elasticsearch
+        yield f"data: {json.dumps({'event': 'status', 'message': 'Retrieving best chunks...'})}\n\n"
         if debug:
             print("\n" + "="*60)
             print("RETRIEVING CHUNKS FOR EACH QUERY")
@@ -1442,44 +1877,140 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
         # Process Elasticsearch chunks if we have any
         if len(all_chunks_dict) > 0:
             if full_paper_processing:
-                # If full paper processing, get ALL chunks for the final papers (sorted by paper_id, then chunk_index)
+                # If full paper processing, write FULL papers to files and use only top 5 chunks for GPT
                 if debug:
                     print(f"\n[Full Paper] ========== PROCESSING FULL PAPERS ==========")
-                    print(f"[Full Paper] Using ALL chunks from {len(final_paper_ids)} papers: {final_paper_ids}")
+                    print(f"[Full Paper] Writing full papers from {len(final_paper_ids)} papers: {final_paper_ids}")
                     print(f"[Full Paper] Total chunks in all_chunks_dict: {len(all_chunks_dict)}")
                 
-                # Collect all chunks for final papers, sorted by paper_id and chunk_index
-                chunks_to_use = []
-                for paper_id in final_paper_ids:
-                    paper_chunks = [(k, v) for k, v in all_chunks_dict.items() if k[0] == paper_id]
-                    # Sort by chunk_index
-                    paper_chunks.sort(key=lambda x: x[0][1])
-                    chunks_to_use.extend(paper_chunks)
-                    if debug:
-                        print(f"[Full Paper] Paper {paper_id}: found {len(paper_chunks)} chunks")
+                # Write full papers (all chunks) to text files in /public/ directory
+                public_dir = os.path.join(os.path.dirname(__file__), '..', 'public')
+                os.makedirs(public_dir, exist_ok=True)
                 
-                context_chunk_count = len(chunks_to_use)
+                yield f"data: {json.dumps({'event': 'status', 'message': 'Summarizing papers...'})}\n\n"
+                
+                for rank, paper_id in enumerate(final_paper_ids[:5], 1):  # Limit to top 5 papers
+                    paper_text_parts = []
+                    
+                    # Collect all chunks for this paper (sorted by chunk_index)
+                    paper_chunks = [(k, v) for k, v in all_chunks_dict.items() if k[0] == paper_id]
+                    if paper_chunks:
+                        paper_chunks.sort(key=lambda x: x[0][1])
+                        
+                        if debug:
+                            print(f"[Full Paper] Paper {paper_id}: found {len(paper_chunks)} chunks")
+                        
+                        # Collect all chunk texts for this paper
+                        for (pid, chunk_index), chunk_data in paper_chunks:
+                            source_data = chunk_data["source_data"]
+                            chunk_text = source_data.get("chunk_text", "")
+                            if chunk_text:
+                                paper_text_parts.append(chunk_text)
+                        
+                        # Remove overlapping text between consecutive chunks
+                        if len(paper_text_parts) > 1:
+                            original_count = len(paper_text_parts)
+                            paper_text_parts = _remove_overlap_between_chunks(paper_text_parts, min_overlap_length=50)
+                            if debug and len(paper_text_parts) != original_count:
+                                print(f"[Full Paper] Removed overlaps from {original_count} chunks")
+                    else:
+                        # Check if this is an arXiv paper
+                        for arxiv_paper in arxiv_papers:
+                            if arxiv_paper.get("paper_id") == paper_id:
+                                chunk_text = arxiv_paper.get("chunk_text", "")
+                                if chunk_text:
+                                    paper_text_parts.append(chunk_text)
+                                if debug:
+                                    print(f"[Full Paper] Paper {paper_id}: arXiv paper (single chunk)")
+                                break
+                    
+                    # Write the full paper content to a file
+                    if paper_text_parts:
+                        # Join chunks with line breaks - deduplication function already handles spacing for smooth flow
+                        # This preserves chunk separation while maintaining seamless text flow
+                        full_paper_text = "\n\n".join(paper_text_parts)
+                        
+                        # Post-processing: remove any remaining repeated phrases that might have been missed
+                        full_paper_text = _remove_repeated_phrases(full_paper_text, min_phrase_words=10)
+                        
+                        filename = os.path.join(public_dir, f"{rank}.txt")
+                        try:
+                            with open(filename, 'w', encoding='utf-8') as f:
+                                f.write(full_paper_text)
+                            if debug:
+                                print(f"[Full Paper] Wrote paper {paper_id} ({len(paper_text_parts)} chunks) to {filename}")
+                        except Exception as e:
+                            if debug:
+                                print(f"[Full Paper] Error writing {filename}: {e}")
+                        
+                        # Summarize the paper and write summarized version
+                        if debug:
+                            print(f"[Summarization] Summarizing paper {paper_id}...")
+                        
+                        summarized_text = _summarize_paper(full_paper_text, target_ratio=0.15, debug=debug)
+                        
+                        summary_filename = os.path.join(public_dir, f"{rank}_summ.txt")
+                        try:
+                            with open(summary_filename, 'w', encoding='utf-8') as f:
+                                f.write(summarized_text)
+                            if debug:
+                                print(f"[Summarization] Wrote summarized paper {paper_id} to {summary_filename}")
+                        except Exception as e:
+                            if debug:
+                                print(f"[Summarization] Error writing {summary_filename}: {e}")
+                
                 if debug:
-                    print(f"[Full Paper] Total chunks to use in context: {context_chunk_count}")
-                    for pid in final_paper_ids:
-                        pid_chunks = [c for c in chunks_to_use if c[0][0] == pid]
-                        print(f"[Full Paper]   Paper {pid}: {len(pid_chunks)} chunks in context")
+                    print(f"[Full Paper] Wrote {min(5, len(final_paper_ids))} papers to text files in /public/ directory")
+                
+                # Read summaries from files and pass them to GPT instead of chunks
+                context_chunk_count = 0
+                for rank in range(1, min(6, len(final_paper_ids) + 1)):
+                    summary_filename = os.path.join(public_dir, f"{rank}_summ.txt")
+                    try:
+                        if os.path.exists(summary_filename):
+                            with open(summary_filename, 'r', encoding='utf-8') as f:
+                                summary_text = f.read().strip()
+                            if summary_text:
+                                retrieved_texts.append(summary_text)
+                                context_chunk_count += 1
+                                if debug:
+                                    print(f"[Full Paper] Added summary {rank}/5 to GPT context from {summary_filename}")
+                            else:
+                                if debug:
+                                    print(f"[Full Paper] Summary file {summary_filename} is empty")
+                        else:
+                            if debug:
+                                print(f"[Full Paper] Summary file {summary_filename} not found")
+                    except Exception as e:
+                        if debug:
+                            print(f"[Full Paper] Error reading summary {summary_filename}: {e}")
+                
+                if debug:
+                    print(f"[Full Paper] Total summaries sent to GPT: {context_chunk_count}")
                     print(f"[Full Paper] ============================================\n")
                 
-                for (paper_id, chunk_index), chunk_data in chunks_to_use:
-                    source_data = chunk_data["source_data"]
-                    chunk_text = source_data.get("chunk_text", "")
-                    if chunk_text:
-                        retrieved_texts.append(chunk_text)
-                
                 # Build sources list from the first chunk of each paper (for display)
-                for rank, paper_id in enumerate(final_paper_ids, 1):
-                    # Find the first chunk for this paper
+                seen_paper_ids = set()  # Track papers already added to avoid duplicates
+                rank_counter = 1
+                for paper_id in final_paper_ids:
+                    if paper_id in seen_paper_ids:
+                        continue  # Skip if this paper already added
+                    seen_paper_ids.add(paper_id)
+                    
+                    # Find all chunks for this paper
                     paper_chunks = [(k, v) for k, v in all_chunks_dict.items() if k[0] == paper_id]
                     if paper_chunks:
                         paper_chunks.sort(key=lambda x: x[0][1])
                         (first_paper_id, first_chunk_index), first_chunk_data = paper_chunks[0]
                         source_data = first_chunk_data["source_data"]
+                        
+                        # Calculate best scores from all chunks of this paper
+                        best_similarity_score = max((chunk_data["score"] for _, chunk_data in paper_chunks), default=0.0)
+                        # Find best RRF score for this paper from sorted_chunks
+                        best_rrf_score = 0.0
+                        for (pid, cidx), rrf_score in sorted_chunks:
+                            if pid == paper_id:
+                                best_rrf_score = max(best_rrf_score, rrf_score)
                         
                         # Get title and authors from metadata or chunk data
                         title = ""
@@ -1508,16 +2039,22 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
                             "title": title if title else f"Paper {paper_id}",
                             "authors": authors if authors else None,
                             "chunk_index": first_chunk_index,
-                            "rank": rank,
-                            "rrf_score": 0.0,  # Not applicable for full paper
-                            "similarity_score": 0.0,
+                            "rank": rank_counter,
+                            "rrf_score": best_rrf_score,
+                            "similarity_score": best_similarity_score,
                             "url": arxiv_url
                         })
+                        rank_counter += 1
             else:
                 # Normal processing: use top chunks from sorted_chunks
                 if len(sorted_chunks) > 0:
                     context_chunk_count = min(5, len(sorted_chunks))
-                    for rank, ((paper_id, chunk_index), rrf_score) in enumerate(sorted_chunks[:context_chunk_count], 1):
+                    seen_paper_ids = set()  # Track papers already added to avoid duplicates
+                    rank_counter = 1
+                    for ((paper_id, chunk_index), rrf_score) in sorted_chunks[:context_chunk_count]:
+                        if paper_id in seen_paper_ids:
+                            continue  # Skip if this paper already added
+                        seen_paper_ids.add(paper_id)
                         chunk_data = all_chunks_dict.get((paper_id, chunk_index))
                         if not chunk_data:
                             continue
@@ -1556,24 +2093,29 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
                             "title": title if title else f"Paper {paper_id}",
                             "authors": authors if authors else None,
                             "chunk_index": chunk_index,
-                            "rank": rank,
+                            "rank": rank_counter,
                             "rrf_score": rrf_score,
                             "similarity_score": chunk_data["score"],
                             "url": arxiv_url
                         })
+                        rank_counter += 1
         
-        # Add arXiv papers as additional chunks
+        # Add arXiv papers as additional chunks (avoid duplicates with existing sources)
+        seen_paper_ids_from_sources = {s.get("paper_id") for s in sources}
         arxiv_start_rank = len(sources) + 1
         arxiv_paper_count = min(5, len(arxiv_papers))
+        arxiv_added_count = 0
         if len(arxiv_papers) > 0:
             # Update context_chunk_count to include arXiv papers
             context_chunk_count = context_chunk_count + arxiv_paper_count
         for idx, arxiv_paper in enumerate(arxiv_papers[:arxiv_paper_count], start=arxiv_start_rank):
+            paper_id = arxiv_paper.get("paper_id", "unknown")
+            if paper_id in seen_paper_ids_from_sources:
+                continue  # Skip if this arXiv paper already exists in sources
+            seen_paper_ids_from_sources.add(paper_id)
             chunk_text = arxiv_paper.get("chunk_text", "")
             if chunk_text:
                 retrieved_texts.append(chunk_text)
-            
-            paper_id = arxiv_paper.get("paper_id", "unknown")
             
             # Try to get title from metadata index first, fall back to arXiv data
             title = ""
@@ -1598,12 +2140,13 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
                 "title": title if title else f"Paper {paper_id}",
                 "authors": authors if authors else None,
                 "chunk_index": 0,
-                "rank": idx,
+                "rank": arxiv_start_rank + arxiv_added_count,
                 "rrf_score": 0.0,  # arXiv papers don't have RRF scores
                 "similarity_score": 0.0,  # arXiv papers don't have similarity scores
                 "url": arxiv_paper.get("url"),
                 "source": "arxiv_api"
             })
+            arxiv_added_count += 1
         
         context = "\n\n".join(retrieved_texts) if retrieved_texts else "No relevant context found."
         
@@ -1663,6 +2206,7 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
             yield f"data: {json.dumps({'event': 'sources', 'sources': sources})}\n\n"
         
         # Stream deltas (the summary)
+        yield f"data: {json.dumps({'event': 'status', 'message': 'Generating response...'})}\n\n"
         if debug:
             print("[Streaming] Starting to stream response from OpenAI...")
         
@@ -1683,6 +2227,7 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
         
         # Generate individual summaries for each source (top 5)
         if sources and len(sources) > 0:
+            yield f"data: {json.dumps({'event': 'status', 'message': 'Generating relevancy explanations...'})}\n\n"
             if debug:
                 print("\n[Streaming] Generating individual source summaries...")
             
@@ -1717,7 +2262,7 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
                         summary_messages = [
                             {
                                 "role": "system",
-                                "content": "You are a paper finder assistant. Provide a concise one-paragraph summary explaining why a specific paper is relevant to the user's query. Focus on the connection between the paper's content and the user's question."
+                                "content": "You are a paper finder assistant. Write a concise one-paragraph explanation that jumps directly into HOW and WHY the paper connects to the query. Do NOT start with phrases like 'The paper X is highly relevant to the user's query about Y as it explores...' or 'This paper is relevant because...' Instead, immediately begin describing the specific content, methods, findings, or concepts that connect to the query. Write as if continuing a conversation, not introducing a topic."
                             },
                             {
                                 "role": "user",
@@ -1725,7 +2270,7 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
                                     f"User's query: {query}\n\n"
                                     f"Paper title: {source.get('title', 'Unknown')}\n\n"
                                     f"Paper content snippet:\n{chunk_text[:2000]}\n\n"
-                                    f"Provide a concise one-paragraph summary explaining why this paper is relevant to the user's query."
+                                    f"Write a concise one-paragraph explanation that immediately describes the specific ways this paper connects to the query. Start directly with the content, methods, or findings - no introductory phrases about relevance."
                                 )
                             }
                         ]

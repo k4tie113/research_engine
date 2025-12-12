@@ -340,6 +340,8 @@ function App() {
       let fullText = "";
       let finalSources = [];
       let queryAnalysis = null;
+      let isOffTopic = false;
+      let currentStatus = null;
 
       const processBuffer = (buf) => {
         const lines = buf.split("\n\n");
@@ -348,22 +350,53 @@ function App() {
           if (line.startsWith("data: ")) {
             try {
               const payload = JSON.parse(line.slice(6));
-              if (payload.event === "sources" && payload.sources) {
+              if (payload.event === "status" && payload.message) {
+                // Update status message
+                currentStatus = payload.message;
+                setConversations(convs => convs.map(c => {
+                  if (c.id !== activeConversationId) return c;
+                  const newMessages = [...c.messages];
+                  newMessages[placeholderIndex] = { 
+                    role: "bot", 
+                    message: fullText, 
+                    sources: finalSources,
+                    is_off_topic: isOffTopic,
+                    status: currentStatus
+                  };
+                  return { ...c, messages: newMessages };
+                }));
+              } else if (payload.event === "sources" && payload.sources) {
                 // Sources come first - update immediately
                 finalSources = payload.sources || [];
                 setConversations(convs => convs.map(c => {
                   if (c.id !== activeConversationId) return c;
                   const newMessages = [...c.messages];
-                  newMessages[placeholderIndex] = { role: "bot", message: fullText, sources: finalSources };
+                  newMessages[placeholderIndex] = { 
+                    role: "bot", 
+                    message: fullText, 
+                    sources: finalSources,
+                    is_off_topic: isOffTopic,
+                    status: currentStatus
+                  };
                   return { ...c, messages: newMessages };
                 }));
               } else if (payload.event === "delta" && payload.text) {
                 fullText += payload.text;
+                // Clear status when we start receiving content
+                if (fullText.trim()) {
+                  currentStatus = null;
+                }
                 // Update the last bot message progressively (with sources if we have them)
                 setConversations(convs => convs.map(c => {
                   if (c.id !== activeConversationId) return c;
                   const newMessages = [...c.messages];
-                  newMessages[placeholderIndex] = { role: "bot", message: fullText, sources: finalSources };
+                  newMessages[placeholderIndex] = { 
+                    role: "bot", 
+                    message: fullText, 
+                    sources: finalSources,
+                    is_off_topic: isOffTopic,
+                    status: currentStatus
+                  };
                   return { ...c, messages: newMessages };
                 }));
               } else if (payload.event === "done") {
@@ -372,11 +405,20 @@ function App() {
                   finalSources = payload.sources;
                 }
                 queryAnalysis = payload.analysis || null;
-                // Update message with final sources
+                isOffTopic = queryAnalysis?.is_off_topic || false;
+                // Clear status when done
+                currentStatus = null;
+                // Update message with final sources and analysis
                 setConversations(convs => convs.map(c => {
                   if (c.id !== activeConversationId) return c;
                   const newMessages = [...c.messages];
-                  newMessages[placeholderIndex] = { role: "bot", message: fullText, sources: finalSources };
+                  newMessages[placeholderIndex] = { 
+                    role: "bot", 
+                    message: fullText, 
+                    sources: finalSources,
+                    is_off_topic: isOffTopic,
+                    status: null
+                  };
                   return { ...c, messages: newMessages };
                 }));
               }
@@ -401,7 +443,13 @@ function App() {
         convs.map(c => {
           if (c.id !== activeConversationId) return c;
           const newMessages = [...c.messages];
-          newMessages[placeholderIndex] = { role: "bot", message: fullText, sources: finalSources };
+          newMessages[placeholderIndex] = { 
+            role: "bot", 
+            message: fullText, 
+            sources: finalSources,
+            is_off_topic: isOffTopic,
+            status: null
+          };
           return { ...c, messages: newMessages, loading: false };
         })
       );
@@ -421,6 +469,20 @@ function App() {
   const showModeTabs = isNewConversation(activeConversation);
 
   return (
+    <>
+      <style>{`
+        @keyframes pulse {
+          0%, 100% {
+            opacity: 1;
+          }
+          50% {
+            opacity: 0.5;
+          }
+        }
+        .status-pulse {
+          animation: pulse 1.5s ease-in-out infinite;
+        }
+      `}</style>
     <div style={styles.container}>
       {/* Left Sidebar - Conversations */}
       <div style={styles.sidebar}>
@@ -504,6 +566,25 @@ function App() {
               backgroundColor: m.role === "user" ? "#d7f3eb" : "#f4f9f7",
             }}
           >
+            {/* Status message - show at the very top for bot messages */}
+            {m.role === "bot" && m.status && (
+              <>
+                <div style={styles.statusMessage} className="status-pulse">
+                  <strong>{m.status}</strong>
+                </div>
+                {(m.message || (m.sources && m.sources.length > 0)) && (
+                  <div style={styles.statusDivider}></div>
+                )}
+              </>
+            )}
+            
+            {/* Off-topic warning - show at the top for bot messages */}
+            {m.role === "bot" && m.is_off_topic && (
+              <div style={styles.offTopicWarning}>
+                <strong>Warning:</strong> This request may be irrelevant to the paper corpus. The corpus focuses on computer science, natural language processing, and AI/ML topics. The following response has a higher likelihood of providing hallucinated or irrelevant information.
+              </div>
+            )}
+            
             {/* Sources section - show ABOVE the message for bot messages */}
             {m.role === "bot" && m.sources && m.sources.length > 0 && (
               <div style={styles.sources}>
@@ -563,7 +644,9 @@ function App() {
         ))}
         {activeConversation.loading && !(messages.length > 0 && messages[messages.length - 1].role === "bot") && (
           <div style={{ ...styles.message, backgroundColor: "#f4f9f7" }}>
-            <p style={styles.text}>Searching for papers...</p>
+            <div style={styles.statusMessage} className="status-pulse">
+              <strong>Searching for papers...</strong>
+            </div>
           </div>
         )}
       </div>
@@ -664,56 +747,6 @@ function App() {
             </div>
           </div>
 
-          {/* Venues */}
-          <div style={styles.filterSection}>
-            <label style={styles.filterLabel}>Venues</label>
-            <div style={styles.tagInputContainer}>
-              {activeConversation.filters.venues.map((venue, idx) => (
-                <div key={idx} style={styles.tag}>
-                  {venue}
-                  <button
-                    onClick={() => {
-                      const newVenues = activeConversation.filters.venues.filter((_, i) => i !== idx);
-                      updateFilters({ venues: newVenues });
-                    }}
-                    style={styles.tagRemove}
-                  >
-                    ×
-                  </button>
-                </div>
-              ))}
-              <input
-                type="text"
-                placeholder="Add venue..."
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && e.target.value.trim()) {
-                    updateFilters({
-                      venues: [...activeConversation.filters.venues, e.target.value.trim()]
-                    });
-                    e.target.value = "";
-                  }
-                }}
-                style={styles.tagInput}
-              />
-            </div>
-          </div>
-
-          {/* Query Type */}
-          <div style={styles.filterSection}>
-            <label style={styles.filterLabel}>Query Type</label>
-            <select
-              value={activeConversation.filters.queryType || ""}
-              onChange={(e) => updateFilters({ queryType: e.target.value || null })}
-              style={styles.selectInput}
-            >
-              <option value="">Any</option>
-              <option value="BROAD_BY_DESCRIPTION">Broad by Description</option>
-              <option value="SPECIFIC_BY_TITLE">Specific by Title</option>
-              <option value="SPECIFIC_BY_NAME">Specific by Name</option>
-              <option value="BY_AUTHOR">By Author</option>
-            </select>
-          </div>
-
           {/* Full Paper Processing */}
           <div style={styles.filterSection}>
             <label style={styles.filterLabel}>
@@ -759,6 +792,7 @@ function App() {
         {filtersOpen ? "◀" : "▶"}
       </button>
     </div>
+    </>
   );
 }
 
@@ -928,6 +962,35 @@ const styles = {
   },
   sources: {
     marginBottom: "0.8rem",
+  },
+  statusMessage: {
+    marginBottom: "0.5rem",
+    fontSize: "0.95rem",
+    color: "#1c776a",
+    fontWeight: "bold",
+    animation: "pulse 1.5s ease-in-out infinite",
+  },
+  "@keyframes pulse": {
+    "0%, 100%": {
+      opacity: 1,
+    },
+    "50%": {
+      opacity: 0.6,
+    },
+  },
+  statusDivider: {
+    marginBottom: "0.8rem",
+    borderTop: "1px solid #e0e0e0",
+  },
+  offTopicWarning: {
+    padding: "0.8rem",
+    marginBottom: "1rem",
+    backgroundColor: "#fff3cd",
+    border: "1px solid #ffc107",
+    borderRadius: "8px",
+    color: "#856404",
+    fontSize: "0.9rem",
+    lineHeight: "1.5",
   },
   sourcesTitle: {
     fontWeight: "bold",
