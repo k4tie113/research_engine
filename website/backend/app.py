@@ -2,21 +2,28 @@ from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 import sys
 from pathlib import Path
+import json
 
 # Add the retrieval directory to the path
 sys.path.append(str(Path(__file__).resolve().parents[2] / "retrieval"))
 
 # Import RAG service from retrieval module
-from rag_service import get_rag_response, format_sources, get_system_status, stream_rag_response
+from rag_service import (
+    get_rag_response,
+    get_system_status,
+    stream_rag_response,
+)
 from query_analyzer import analyze_query
 
 app = Flask(__name__)
 CORS(app)
 
+
 @app.get("/api/status")
 def status():
     """Check if the RAG system is initialized."""
     return jsonify(get_system_status())
+
 
 def _augment_query_with_analysis(base: str, analysis: dict) -> str:
     """
@@ -54,11 +61,11 @@ def _augment_query_with_analysis(base: str, analysis: dict) -> str:
         elif end:
             lines.append(f"Before: {end}")
 
-    # Combine base query with hints
     if not lines:
         return base
-    
+
     return base + "\n\nFilters:\n" + "\n".join(lines)
+
 
 @app.post("/api/analyze")
 def api_analyze():
@@ -66,106 +73,133 @@ def api_analyze():
     Endpoint to analyze a query without executing the search.
     Useful for debugging or understanding how the query is interpreted.
     """
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     query = (data.get("message") or data.get("query") or "").strip()
-    
+
     if not query:
         return jsonify({"error": "Empty query"}), 400
-    
+
     try:
         analysis = analyze_query(query)
         return jsonify(analysis)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.post("/api/chat")
 def api_chat():
     """
     Main chat endpoint.
-    1. Analyzes the user's query
-    2. Enhances it with extracted metadata
-    3. Retrieves relevant papers using RAG
-    4. Returns answer with sources
+    1) Analyze user's query
+    2) Enhance it with extracted metadata
+    3) Retrieve + generate answer (RAG)
+    4) Return answer + structured sources (incl relevance scoring)
     """
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
+
     message = (data.get("message") or "").strip()
     conversation_history = data.get("conversation_history", [])
+    user_filters = data.get("filters", {}) or {}
 
     if not message:
-        return jsonify({"reply": "Please enter a message."})
+        return jsonify({"reply": "Please enter a message.", "sources": []}), 400
 
     try:
         # Step 1: Analyze the query
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("NEW QUERY")
-        print("="*60)
+        print("=" * 60)
+
         analysis = analyze_query(message)
-        
+
         print(f"Original Query: {message}")
         print(f"Extracted Content: {analysis.get('content')}")
         print(f"Query Type: {analysis.get('query_type')}")
         print(f"Authors: {analysis.get('authors')}")
         print(f"Venues: {analysis.get('venues')}")
         print(f"Time Range: {analysis.get('time_range')}")
-        print("="*60 + "\n")
+        print("=" * 60 + "\n")
 
         # Step 2: Build enhanced query
-        # Use extracted content as base, fall back to original message
         base_query = analysis.get("content") or message
         enhanced_query = _augment_query_with_analysis(base_query, analysis)
-        
+
         print(f"Enhanced Query for RAG:\n{enhanced_query}\n")
 
         # Step 3: Retrieve relevant papers and generate answer
         answer, sources = get_rag_response(
             enhanced_query,
-            top_k=5, 
+            top_k=10,
             debug=True,
             conversation_history=conversation_history,
-            user_filters=data.get("filters", {})
+            user_filters=user_filters,
+            query_analysis=analysis,
         )
 
+        return jsonify(
+            {
+                "reply": answer,
+                "analysis": analysis,
+                "enhanced_query": enhanced_query,
+                "sources": sources,  # should already include relevance_* fields
+            }
+        )
 
-        # Step 4: Return response (sources are already included first in answer)
-        # The get_rag_response function now returns sources first, then summary
-        return jsonify({
-            "reply": answer,  # Already includes sources first
-            "analysis": analysis,
-            "enhanced_query": enhanced_query
-        })
-        
     except Exception as e:
         print(f"ERROR in /api/chat: {e}")
         import traceback
         traceback.print_exc()
-        return jsonify({
-            "reply": f"Sorry, an error occurred: {str(e)}"
-        }), 500
+        return jsonify({"reply": f"Sorry, an error occurred: {str(e)}", "sources": []}), 500
 
 
-@app.route("/api/chat_stream", methods=["POST"])
+@app.post("/api/chat_stream")
 def chat_stream():
-    data = request.get_json()
-    message = data.get("message", "").strip()
+    """
+    Streaming chat endpoint (Server-Sent Events).
+    IMPORTANT: We run analyze_query + augment query here too, so streaming and non-streaming match.
+    """
+    data = request.get_json(silent=True) or {}
+
+    message = (data.get("message") or "").strip()
     conversation_history = data.get("conversation_history", [])
-    filters = data.get("filters", {})
+    user_filters = data.get("filters", {}) or {}
 
     if not message:
         return jsonify({"error": "Please enter a message."}), 400
 
     def generate():
-        yield from stream_rag_response(message, top_k=5, max_tokens=600, debug=True, conversation_history=conversation_history, user_filters=filters)
+        try:
+            # Analyze + enhance query (match /api/chat behavior)
+            analysis = analyze_query(message)
+            base_query = analysis.get("content") or message
+            enhanced_query = _augment_query_with_analysis(base_query, analysis)
+
+            # stream_rag_response emits SSE lines: `data: {json}\n\n`
+            # It also emits sources with relevance fields.
+            yield from stream_rag_response(
+                enhanced_query,
+                top_k=10,
+                max_tokens=600,
+                debug=True,
+                conversation_history=conversation_history,
+                user_filters=user_filters,
+            )
+        except Exception as e:
+            payload = {"event": "error", "message": str(e)}
+            yield f"data: {json.dumps(payload)}\n\n"
 
     return Response(generate(), mimetype="text/event-stream")
 
+
 if __name__ == "__main__":
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Starting Paper Finder Backend")
-    print("="*60)
+    print("=" * 60)
     print("Endpoints:")
-    print("  GET  /api/status  - Check system status")
-    print("  POST /api/analyze - Analyze a query")
-    print("  POST /api/chat    - Full chat with RAG")
-    print("="*60 + "\n")
-    
-    app.run(debug=True, port=5000, host='127.0.0.1')
+    print("  GET  /api/status      - Check system status")
+    print("  POST /api/analyze     - Analyze a query")
+    print("  POST /api/chat        - Full chat with RAG")
+    print("  POST /api/chat_stream - Streaming chat with RAG")
+    print("=" * 60 + "\n")
+
+    app.run(debug=True, port=5000, host="0.0.0.0")

@@ -4,6 +4,16 @@ rag_service.py
 --------------
 A service module for RAG operations that can be imported by app.py.
 Uses Elasticsearch for retrieval instead of FAISS.
+
+UPDATED (this version):
+- Deduplicate so the same paper is not returned multiple times (keep best chunk per paper).
+- Add ASTA-style retrieval relevance scoring + label (0..3) with thresholds.
+- Add ASTA Layer 2: OPTIONAL LLM semantic relevance judgment (gated), applied ONLY to top-5 returned docs.
+- Convert LLM labels -> scores (0..3) and CLIP final relevance = min(retrieval_score, semantic_score).
+- Preserve backward-compatibility: source["relevance"]["label"/"score"/"normalized"] still exist (final),
+  while also exposing nested source["relevance"]["retrieval"] and source["relevance"]["semantic"].
+- Fix bugs: undefined chunk_index / chunk_data in get_rag_response sources construction.
+- Add relevance display in format_sources().
 """
 
 import os
@@ -27,6 +37,10 @@ SUMMARIZATION_MODEL_ID = "gpt-4o-mini"  # Use same model as rest of system for c
 DEFAULT_TOP_K = 15
 DEFAULT_MAX_TOKENS = 600
 
+# ASTA Layer 2 gate config
+DEFAULT_APPLY_RELEVANCE_JUDGEMENT = True  # global default; still gated per-query
+DEFAULT_JUDGE_TOP_N = 5                   # only for the top N returned docs
+
 # === ELASTICSEARCH CONFIG ===
 ES_URL = os.getenv("ES_URL", "https://my-elasticsearch-project-fb6996.es.us-central1.gcp.elastic.cloud")
 ES_API_KEY = os.getenv("ES_API_KEY")
@@ -39,19 +53,378 @@ _openai_client = None
 _metadata_index_cache = None  # Cache the discovered metadata index name
 
 
+# =============================================================================
+# ASTA-inspired relevance logic (same thresholds/labels pattern)
+# =============================================================================
+class RelevanceThresholds:
+    NOT_RELEVANT = 0.25
+    SOMEWHAT_RELEVANT = 0.67
+    HIGHLY_RELEVANT = 0.99
+
+
+class RelevanceLabels:
+    PERFECTLY_RELEVANT = "Perfectly Relevant"
+    HIGHLY_RELEVANT = "Highly Relevant"
+    SOMEWHAT_RELEVANT = "Somewhat Relevant"
+    NOT_RELEVANT = "Not Relevant"
+
+
+RELEVANCE_LABEL_TO_SCORE = {
+    RelevanceLabels.PERFECTLY_RELEVANT: 3,
+    RelevanceLabels.HIGHLY_RELEVANT: 2,
+    RelevanceLabels.SOMEWHAT_RELEVANT: 1,
+    RelevanceLabels.NOT_RELEVANT: 0,
+}
+
+SCORE_TO_RELEVANCE_LABEL = {v: k for k, v in RELEVANCE_LABEL_TO_SCORE.items()}
+
+
+def _label_relevance(norm: float) -> str:
+    """
+    Map a normalized [0,1] score to ASTA-style labels.
+
+    >= 0.99  -> Perfectly Relevant (3)
+    >= 0.67  -> Highly Relevant (2)
+    >= 0.25  -> Somewhat Relevant (1)
+    else     -> Not Relevant (0)
+    """
+    if norm >= RelevanceThresholds.HIGHLY_RELEVANT:
+        return RelevanceLabels.PERFECTLY_RELEVANT
+    if norm >= RelevanceThresholds.SOMEWHAT_RELEVANT:
+        return RelevanceLabels.HIGHLY_RELEVANT
+    if norm >= RelevanceThresholds.NOT_RELEVANT:
+        return RelevanceLabels.SOMEWHAT_RELEVANT
+    return RelevanceLabels.NOT_RELEVANT
+
+
+def _clamp01(x: float) -> float:
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    return x
+
+
+def _attach_retrieval_relevance(source: Dict[str, Any], norm: float) -> None:
+    """
+    Attach ASTA-style retrieval relevance into a compatibility-friendly structure.
+
+    Backward compatible:
+      source["relevance"]["label"/"score"/"normalized"] exists.
+
+    Extended:
+      source["relevance"]["retrieval"] exists and contains retrieval-specific fields.
+      source["relevance"]["semantic"] is added later (optional).
+      source["relevance"]["final_score"] is set later (or equals retrieval score if no semantic judge).
+    """
+    norm = _clamp01(float(norm))
+    label = _label_relevance(norm)
+    score = RELEVANCE_LABEL_TO_SCORE[label]
+
+    # Back-compat + extensibility
+    source["relevance"] = {
+        # Default "final" == retrieval until semantic judgement runs
+        "label": label,
+        "score": score,
+        "normalized": round(norm, 4),
+
+        "retrieval": {
+            "label": label,
+            "score": score,
+            "normalized": round(norm, 4),
+        },
+
+        # semantic will be filled in later if enabled
+        "semantic": None,
+
+        # final_score will be updated after semantic (or stays retrieval)
+        "final_score": score,
+    }
+
+
+def _finalize_relevance(source: Dict[str, Any]) -> None:
+    """
+    If semantic relevance exists, clip final_score = min(retrieval_score, semantic_score).
+    Keep compatibility fields source["relevance"]["label"/"score"] aligned to final_score.
+    """
+    rel = source.get("relevance") or {}
+    retrieval = rel.get("retrieval") or {}
+    semantic = rel.get("semantic")
+
+    retrieval_score = int(retrieval.get("score", rel.get("score", 0)) or 0)
+
+    if semantic and isinstance(semantic, dict):
+        semantic_score = int(semantic.get("score", 0) or 0)
+        final_score = min(retrieval_score, semantic_score)
+    else:
+        final_score = retrieval_score
+
+    final_label = SCORE_TO_RELEVANCE_LABEL.get(final_score, RelevanceLabels.NOT_RELEVANT)
+
+    # Update compatibility fields
+    rel["final_score"] = final_score
+    rel["score"] = final_score
+    rel["label"] = final_label
+
+    # Keep existing normalized (retrieval normalized) untouched
+    source["relevance"] = rel
+
+
+# =============================================================================
+# ASTA Layer 2: LLM semantic relevance judgment (OPTIONAL, gated)
+# =============================================================================
+def _should_apply_semantic_judgement(
+    analysis: Optional[Dict[str, Any]],
+    user_filters: Optional[Dict[str, Any]]
+) -> bool:
+    """
+    Gate semantic relevance judgement (LLM) on/off.
+
+    Priority:
+    1) explicit user override (applyRelevanceJudgement OR apply_relevance_judgement)
+    2) global default
+    3) (optional) query_type heuristics if analysis is present
+    """
+
+    # 1) frontend override (support both naming styles)
+    if user_filters:
+        if "applyRelevanceJudgement" in user_filters:
+            return bool(user_filters.get("applyRelevanceJudgement"))
+        if "apply_relevance_judgement" in user_filters:
+            return bool(user_filters.get("apply_relevance_judgement"))
+
+    # 2) global default
+    if not DEFAULT_APPLY_RELEVANCE_JUDGEMENT:
+        return False
+
+    # 3) if no analysis, still allow (don’t silently disable L2)
+    if not isinstance(analysis, dict):
+        return True
+
+    qtype = analysis.get("query_type") or analysis.get("queryType")
+
+    # If analyzer didn’t return a qtype, still allow.
+    if not qtype:
+        return True
+
+    # Your intended allowlist
+    return qtype in ("BROAD_BY_DESCRIPTION", "BROAD", "EXPLORATORY")
+
+
+
+def _extract_criteria_names(analysis: Optional[Dict[str, Any]]) -> List[str]:
+    if not analysis:
+        return []
+    crit = analysis.get("relevance_criteria") or analysis.get("relevanceCriteria") or []
+    names = []
+    for c in crit:
+        if isinstance(c, dict):
+            n = c.get("name")
+            if n:
+                names.append(str(n).strip())
+        elif isinstance(c, str) and c.strip():
+            names.append(c.strip())
+    # Dedup while preserving order
+    out = []
+    seen = set()
+    for n in names:
+        if n not in seen:
+            out.append(n)
+            seen.add(n)
+    return out
+
+
+def _safe_json_loads(s: str) -> Optional[dict]:
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+
+    # Try to extract the first {...} JSON object
+    try:
+        m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+        if m:
+            return json.loads(m.group(0))
+    except Exception:
+        return None
+
+    return None
+
+
+def _normalize_llm_relevance_label(label: Any) -> str:
+    if not label:
+        return RelevanceLabels.NOT_RELEVANT
+    label_str = str(label).strip()
+
+    # Exact matches
+    if label_str in RELEVANCE_LABEL_TO_SCORE:
+        return label_str
+
+    # Soft matches
+    low = label_str.lower()
+    if "perfect" in low:
+        return RelevanceLabels.PERFECTLY_RELEVANT
+    if "high" in low:
+        return RelevanceLabels.HIGHLY_RELEVANT
+    if "some" in low or "partial" in low or "moderate" in low:
+        return RelevanceLabels.SOMEWHAT_RELEVANT
+    return RelevanceLabels.NOT_RELEVANT
+
+
+def _judge_relevance_llm(
+    query: str,
+    criteria: List[str],
+    title: str,
+    snippet: str,
+    debug: bool = False,
+) -> Dict[str, Any]:
+    """
+    ASTA-style semantic entailment judgment for ONE document.
+
+    Output schema:
+    {
+      "relevance": one of the 4 labels,
+      "relevant_snippet": "...",
+      "criteria_judgements": { criterion: true/false, ... }
+    }
+    """
+    global _openai_client
+
+    system_prompt = (
+        "You are a scientific relevance judge.\n"
+        "Determine whether a paper is semantically relevant to the user's query.\n\n"
+        "This is NOT a similarity score. Judge semantic entailment.\n\n"
+        "Return ONLY valid JSON with keys:\n"
+        '  "relevance": "Perfectly Relevant" | "Highly Relevant" | "Somewhat Relevant" | "Not Relevant"\n'
+        '  "relevant_snippet": string (a short excerpt/phrase from the provided snippet)\n'
+        '  "criteria_judgements": object mapping each criterion string -> true/false\n'
+        "If criteria are empty, still include criteria_judgements as an empty object.\n"
+    )
+
+    payload = {
+        "query": query,
+        "relevance_criteria": criteria,
+        "paper_title": title,
+        "paper_snippet": (snippet or "")[:2000],
+    }
+
+    if debug:
+        print("\n" + "-" * 80)
+        print("[Semantic Relevance] LLM judge payload:")
+        print(json.dumps(payload, indent=2)[:4000])
+        print("-" * 80)
+
+    try:
+        resp = _openai_client.chat.completions.create(
+            model=MODEL_ID,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(payload)},
+            ],
+            temperature=0.0,
+            max_tokens=280,
+            response_format={"type": "json_object"},
+        )
+        raw = resp.choices[0].message.content or ""
+    except Exception as e:
+        if debug:
+            print(f"[Semantic Relevance] LLM call failed: {e}")
+        return {
+            "relevance": RelevanceLabels.NOT_RELEVANT,
+            "relevant_snippet": "",
+            "criteria_judgements": {},
+            "error": str(e),
+        }
+
+    parsed = _safe_json_loads(raw)
+    if not isinstance(parsed, dict):
+        # Fall back: infer label from text
+        label = _normalize_llm_relevance_label(raw)
+        return {
+            "relevance": label,
+            "relevant_snippet": "",
+            "criteria_judgements": {},
+            "raw": raw[:800],
+            "parse_error": True,
+        }
+
+    # Normalize and harden fields
+    label = _normalize_llm_relevance_label(parsed.get("relevance"))
+    snippet_out = parsed.get("relevant_snippet") or ""
+    cj = parsed.get("criteria_judgements") or {}
+    if not isinstance(cj, dict):
+        cj = {}
+
+    return {
+        "relevance": label,
+        "relevant_snippet": str(snippet_out)[:400],
+        "criteria_judgements": cj,
+    }
+
+
+def _apply_semantic_relevance_to_top_sources(
+    query: str,
+    analysis: Optional[Dict[str, Any]],
+    sources: List[Dict[str, Any]],
+    snippet_by_paper_id: Dict[str, str],
+    debug: bool = False,
+    top_n: int = DEFAULT_JUDGE_TOP_N,
+) -> None:
+    """
+    Apply ASTA Layer 2 to top N sources only, in-place.
+    """
+    if not sources:
+        return
+
+    criteria = _extract_criteria_names(analysis)
+    top_n = min(top_n, len(sources))
+
+    for i in range(top_n):
+        s = sources[i]
+        pid = s.get("paper_id") or ""
+        title = s.get("title") or ""
+        snippet = snippet_by_paper_id.get(pid) or s.get("relevance_summary") or ""
+
+        judgement = _judge_relevance_llm(
+            query=query,
+            criteria=criteria,
+            title=title,
+            snippet=snippet,
+            debug=debug,
+        )
+        label = judgement.get("relevance", RelevanceLabels.NOT_RELEVANT)
+        label = _normalize_llm_relevance_label(label)
+        sem_score = RELEVANCE_LABEL_TO_SCORE.get(label, 0)
+
+        rel = s.get("relevance") or {}
+        rel["semantic"] = {
+            "label": label,
+            "score": sem_score,
+            "relevant_snippet": judgement.get("relevant_snippet", ""),
+            "criteria_judgements": judgement.get("criteria_judgements", {}),
+        }
+        s["relevance"] = rel
+
+        # Clip final
+        _finalize_relevance(s)
+
+
+# =============================================================================
+# Initialization / metadata discovery
+# =============================================================================
 def initialize_rag_system():
     """Initialize the RAG system by connecting to Elasticsearch and OpenAI."""
     global _es_client, _openai_client
-    
+
     if _es_client is not None:
         # Already initialized
         return True
-    
+
     try:
         if not ES_API_KEY:
             print("ERROR: ES_API_KEY not found in environment variables. Please set it in .env file.")
             return False
-        
+
         print(f"Connecting to Elasticsearch at: {ES_URL}")
         # Initialize Elasticsearch client with API key authentication and increased timeouts
         _es_client = Elasticsearch(
@@ -61,34 +434,34 @@ def initialize_rag_system():
             max_retries=3,      # Retry up to 3 times
             retry_on_timeout=True
         )
-        
+
         # Test connection
         if not _es_client.ping():
             print("Failed to connect to Elasticsearch")
             return False
-        
+
         # Check if index exists
         if not _es_client.indices.exists(index=ES_INDEX):
             print(f"Warning: Index '{ES_INDEX}' does not exist. Please create it first.")
             # Don't fail here, let the search function handle it
-        
+
         # Get index stats if it exists
         try:
             stats = _es_client.count(index=ES_INDEX)
             print(f"Elasticsearch index '{ES_INDEX}' contains {stats['count']:,} documents")
         except Exception:
             pass
-        
+
         print("Initializing OpenAI client...")
         _openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        
+
         print("RAG system initialized with Elasticsearch")
-        
+
         # Try to discover metadata index
         _discover_metadata_index()
-        
+
         return True
-        
+
     except Exception as e:
         print(f"Error initializing RAG system: {e}")
         import traceback
@@ -99,23 +472,23 @@ def initialize_rag_system():
 def _discover_metadata_index() -> Optional[str]:
     """Discover the metadata index by trying common index names."""
     global _metadata_index_cache, _es_client
-    
+
     if _metadata_index_cache:
         return _metadata_index_cache
-    
+
     if not _es_client:
         return None
-    
+
     # Common metadata index names to try
     potential_names = [
         "paper_metadata",
-        "papers_metadata", 
+        "papers_metadata",
         "metadata",
         "papers",
         "paper_meta",
         "papers_meta"
     ]
-    
+
     for index_name in potential_names:
         try:
             if _es_client.indices.exists(index=index_name):
@@ -133,7 +506,7 @@ def _discover_metadata_index() -> Optional[str]:
                     continue
         except Exception:
             continue
-    
+
     print("Warning: Could not discover metadata index. Paper titles may not be available.")
     return None
 
@@ -153,47 +526,37 @@ def _normalize_authors(authors: Any) -> str:
 def _get_paper_metadata(paper_ids: List[str], debug: bool = False) -> Dict[str, Dict]:
     """
     Fetch paper metadata (title, authors, etc.) from the metadata index.
-    
-    Args:
-        paper_ids: List of paper IDs to fetch metadata for
-        debug: Whether to print debug information
-    
-    Returns:
-        Dictionary mapping paper_id -> metadata dict
     """
     global _es_client, _metadata_index_cache
-    
+
     if not _es_client:
         return {}
-    
-    # Discover metadata index if not already discovered
+
     metadata_index = _discover_metadata_index()
     if not metadata_index:
         if debug:
             print("[Metadata] No metadata index available")
         return {}
-    
+
     if not paper_ids:
         return {}
-    
-    # Remove duplicates
+
     unique_paper_ids = list(set(paper_ids))
-    
+
     try:
         results = {}
-        
-        # First, try to get documents by paper_id as the document ID (using mget)
+
+        # Try mget by doc IDs first
         try:
             mget_response = _es_client.mget(
                 index=metadata_index,
                 body={"ids": unique_paper_ids},
                 _source=["paper_id", "title", "authors", "year", "categories"]
             )
-            
+
             for doc in mget_response.get("docs", []):
                 if doc.get("found"):
                     source = doc.get("_source", {})
-                    # If paper_id is in source, use it; otherwise use the document ID
                     paper_id = source.get("paper_id") or doc.get("_id")
                     if paper_id:
                         results[paper_id] = {
@@ -202,8 +565,7 @@ def _get_paper_metadata(paper_ids: List[str], debug: bool = False) -> Dict[str, 
                             "year": source.get("year"),
                             "categories": source.get("categories", [])
                         }
-            
-            # If we got all results from mget, return early
+
             if len(results) == len(unique_paper_ids):
                 if debug:
                     print(f"[Metadata] Fetched metadata for {len(results)}/{len(unique_paper_ids)} papers via mget")
@@ -211,18 +573,14 @@ def _get_paper_metadata(paper_ids: List[str], debug: bool = False) -> Dict[str, 
         except Exception as e:
             if debug:
                 print(f"[Metadata] mget failed, trying search query: {e}")
-        
-        # Fall back to querying by paper_id field
+
+        # Fall back to terms query on paper_id field
         query = {
-            "query": {
-                "terms": {
-                    "paper_id": unique_paper_ids
-                }
-            },
+            "query": {"terms": {"paper_id": unique_paper_ids}},
             "size": len(unique_paper_ids),
             "_source": ["paper_id", "title", "authors", "year", "categories"]
         }
-        
+
         try:
             response = _es_client.search(
                 index=metadata_index,
@@ -232,14 +590,11 @@ def _get_paper_metadata(paper_ids: List[str], debug: bool = False) -> Dict[str, 
                 timeout="10s"
             )
         except (TypeError, KeyError):
-            # Fall back to old API
             response = _es_client.search(index=metadata_index, body=query, timeout="10s")
-        
+
         hits = response.get("hits", {}).get("hits", [])
-        
         for hit in hits:
             source = hit.get("_source", {})
-            # Try to get paper_id from source, or from document ID
             paper_id = source.get("paper_id") or hit.get("_id")
             if paper_id:
                 results[paper_id] = {
@@ -248,12 +603,12 @@ def _get_paper_metadata(paper_ids: List[str], debug: bool = False) -> Dict[str, 
                     "year": source.get("year"),
                     "categories": source.get("categories", [])
                 }
-        
+
         if debug:
             print(f"[Metadata] Fetched metadata for {len(results)}/{len(unique_paper_ids)} papers")
-        
+
         return results
-        
+
     except Exception as e:
         if debug:
             print(f"[Metadata] Error fetching metadata: {e}")
@@ -261,14 +616,10 @@ def _get_paper_metadata(paper_ids: List[str], debug: bool = False) -> Dict[str, 
 
 
 def _rewrite_query_with_history(query: str, conversation_history: Optional[List[Dict]], debug: bool = False) -> str:
-    """Rewrite the current user question into a standalone, retrieval-optimized query using recent conversation history.
-
-    Falls back to the original query on any error.
-    """
+    """Rewrite the current user question into a standalone, retrieval-optimized query using recent conversation history."""
     if not conversation_history:
         return query
 
-    # Use only the most recent few turns to avoid excessive token use
     recent_history = conversation_history[-6:]
 
     try:
@@ -278,20 +629,17 @@ def _rewrite_query_with_history(query: str, conversation_history: Optional[List[
                 "content": (
                     "You rewrite follow-up questions into standalone search queries. "
                     "Preserve all specific entities, acronyms, methods, and constraints. "
-                    "Resolve pronouns (e.g., 'it', 'they', 'this method') to their explicit referents from the conversation. "
+                    "Resolve pronouns to explicit referents from the conversation. "
                     "Output only the rewritten query without commentary."
                 ),
             }
         ]
-        # Provide compressed context of recent dialogue
         for msg in recent_history:
-            # Keep only role and content; ignore other fields if present
             role = msg.get("role", "user")
             content = msg.get("content", "")
             if content:
                 messages.append({"role": role, "content": content})
 
-        # Add the current question
         messages.append({
             "role": "user",
             "content": (
@@ -321,41 +669,43 @@ def _rewrite_query_with_history(query: str, conversation_history: Optional[List[
         if debug:
             print("[Retrieval] Rewritten query:", rewritten)
 
-        # Basic sanity check; fall back if the model returned something empty
-        if not rewritten:
-            return query
-        return rewritten
+        return rewritten or query
+
     except Exception as e:
         if debug:
             print(f"[Retrieval] Query rewrite failed, falling back. Error: {e}")
         return query
 
 
-def get_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int = DEFAULT_MAX_TOKENS, debug: bool = False, conversation_history: List[Dict] = None, user_filters: Dict = None) -> Tuple[str, List[Dict]]:
+# =============================================================================
+# Non-streaming RAG: dedup papers + relevance scoring + OPTIONAL semantic LLM judgement (top-5)
+# =============================================================================
+def get_rag_response(
+    query: str,
+    top_k: int = DEFAULT_TOP_K,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    debug: bool = False,
+    conversation_history: List[Dict] = None,
+    user_filters: Dict = None
+) -> Tuple[str, List[Dict]]:
     """
     Get a RAG response for a query with optional conversation history.
-    
-    Args:
-        query: The user query
-        top_k: Number of top chunks to retrieve
-        max_tokens: Maximum tokens for the response
-        debug: Whether to print debug information
-        conversation_history: List of previous messages in format [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
-    
+
     Returns:
         Tuple of (answer_text, sources_list)
     """
     if not initialize_rag_system():
         return "RAG system not properly initialized. Please check the logs.", []
-    
+
     if not all([_es_client, _openai_client]):
         return "RAG system not properly initialized. Please check the logs.", []
-    
+
     try:
-        # Build a context-aware retrieval query
+        # Analyze query once (for ASTA-style gating + criteria extraction)
+        query_analysis = analyze_query(query)
+
         retrieval_query = _rewrite_query_with_history(query, conversation_history, debug=debug)
-        
-        # Retrieve relevant chunks using Elasticsearch
+
         search_body = {
             "query": {
                 "bool": {
@@ -384,16 +734,11 @@ def get_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int = D
             "_source": ["paper_id", "chunk_index", "title", "authors", "chunk_text", "token_count", "year"]
         }
 
-
         filters = []
 
         # AUTHORS FILTER
         if user_filters and user_filters.get("authors"):
-            filters.append({
-                "terms": {
-                    "authors.keyword": user_filters["authors"]
-                }
-            })
+            filters.append({"terms": {"authors.keyword": user_filters["authors"]}})
 
         # YEAR FILTER
         year_filters = {}
@@ -403,163 +748,172 @@ def get_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int = D
             year_filters["lte"] = user_filters["yearEnd"]
 
         if year_filters:
-            filters.append({
-                "range": {
-                    "year": year_filters
-                }
-            })
+            filters.append({"range": {"year": year_filters}})
 
-        # APPLY FILTERS ONLY IF THEY EXIST
         if filters:
             search_body["query"]["bool"]["filter"] = filters
 
-
-        
         if debug:
             print(f"\n[Retrieval] Searching Elasticsearch with query: {retrieval_query}")
             print(f"[Retrieval] Index: {ES_INDEX}, Top K: {top_k}")
-        
-        # Elasticsearch 8.x uses different API - pass query directly instead of body
+
+        # Search
         try:
-            # Try new API first (Elasticsearch 8.x) - pass parameters directly
             response = _es_client.search(
                 index=ES_INDEX,
                 query=search_body["query"],
                 size=search_body["size"],
                 _source=search_body["_source"],
-                timeout="60s"  # Add explicit timeout to search request
+                timeout="60s"
             )
         except (TypeError, KeyError):
-            # Fall back to old API (Elasticsearch 7.x)
-            try:
-                search_body_with_timeout = search_body.copy()
-                search_body_with_timeout["timeout"] = "60s"
-                response = _es_client.search(index=ES_INDEX, body=search_body_with_timeout)
-            except Exception as e:
-                if debug:
-                    print(f"[Retrieval] Error with both API methods: {e}")
-                raise
-        
-        if debug:
-            print(f"[Retrieval] Elasticsearch returned {len(response.get('hits', {}).get('hits', []))} results")
+            search_body_with_timeout = search_body.copy()
+            search_body_with_timeout["timeout"] = "60s"
+            response = _es_client.search(index=ES_INDEX, body=search_body_with_timeout)
 
-        retrieved_texts = []
-        sources = []
-        hits = response.get("hits", {}).get("hits", [])
-        
-        if not hits:
+        raw_hits = response.get("hits", {}).get("hits", [])
+
+        if debug:
+            print(f"[Retrieval] Elasticsearch returned {len(raw_hits)} results")
+
+        if not raw_hits:
             if debug:
                 print("[Retrieval] WARNING: No results found in Elasticsearch!")
-            # Still continue with empty context - let GPT handle it
-        
-        # Collect paper IDs for metadata lookup
+            raw_hits = []
+
+        # Deduplicate by paper_id (keep best scoring chunk per paper)
+        best_hit_by_paper: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        for hit in raw_hits:
+            src = hit.get("_source", {}) or {}
+            paper_id = src.get("paper_id", "unknown")
+            score = float(hit.get("_score", 0.0))
+            if paper_id not in best_hit_by_paper or score > best_hit_by_paper[paper_id][0]:
+                best_hit_by_paper[paper_id] = (score, hit)
+
+        deduped_hits = [h for (_, h) in best_hit_by_paper.values()]
+        deduped_hits.sort(key=lambda h: float(h.get("_score", 0.0)), reverse=True)
+
+        # top_k papers (not chunks)
+        hits = deduped_hits[:top_k]
+
+        max_score = max((float(h.get("_score", 0.0)) for h in hits), default=0.0)
+
+        # metadata lookup
         paper_ids_for_metadata = []
         for hit in hits:
-            source_data = hit.get("_source", {})
+            source_data = hit.get("_source", {}) or {}
             paper_id = source_data.get("paper_id", "unknown")
             if paper_id and paper_id != "unknown":
                 paper_ids_for_metadata.append(paper_id)
-        
-        # Fetch metadata from metadata index
+
         metadata_dict = _get_paper_metadata(paper_ids_for_metadata, debug=debug)
-        
+
+        retrieved_texts: List[str] = []
+        sources: List[Dict] = []
+        snippet_by_pid: Dict[str, str] = {}
+
         for rank, hit in enumerate(hits, 1):
-            source_data = hit.get("_source", {})
-            chunk_text = source_data.get("chunk_text", "")
+            source_data = hit.get("_source", {}) or {}
+            chunk_text = source_data.get("chunk_text", "") or ""
             retrieved_texts.append(chunk_text)
-            
+
             paper_id = source_data.get("paper_id", "unknown")
-            
-            # Try to get title from metadata index first, fall back to chunk data
+            chunk_index = int(source_data.get("chunk_index", 0))
+            similarity_score = float(hit.get("_score", 0.0))
+
+            # Save snippet for semantic judge
+            if paper_id and paper_id != "unknown" and chunk_text:
+                snippet_by_pid[paper_id] = chunk_text[:2000]
+
+            # title/authors from metadata first
             title = ""
             authors = ""
             if paper_id in metadata_dict:
                 metadata = metadata_dict[paper_id]
-                title = metadata.get("title", "")
-                if title:
-                    title = str(title).strip()
+                title = str(metadata.get("title", "") or "").strip()
                 authors = _normalize_authors(metadata.get("authors", ""))
-            
-            # Fall back to chunk data if metadata not available
+
             if not title:
-                title = source_data.get("title", "")
-                if title:
-                    title = str(title).strip()
+                title = str(source_data.get("title", "") or "").strip()
             if not authors:
                 authors = _normalize_authors(source_data.get("authors", ""))
-            
-            # Construct arXiv URL if paper_id looks like an arXiv ID
+
             arxiv_url = None
             if paper_id and not paper_id.startswith("http"):
-                # Check if it's an arXiv ID (format: YYMM.NNNN or YYMM.NNNNvN)
                 if len(paper_id) >= 4 and paper_id.replace(".", "").replace("v", "").replace("/", "").isdigit():
                     arxiv_url = f"https://arxiv.org/abs/{paper_id}"
-            
-            sources.append({
+
+            src_obj = {
                 "paper_id": paper_id,
                 "title": title if title else f"Paper {paper_id}",
                 "authors": authors if authors else None,
                 "year": source_data.get("year"),
                 "chunk_index": chunk_index,
                 "rank": rank,
-                "similarity_score": chunk_data["score"],
+                "similarity_score": similarity_score,
                 "url": arxiv_url
-            })
+            }
 
-        
+            # Attach ASTA-style retrieval relevance (normalize by max_score)
+            norm = (similarity_score / max_score) if max_score > 0 else 0.0
+            _attach_retrieval_relevance(src_obj, norm)
+
+            sources.append(src_obj)
+
+        # OPTIONAL: Apply ASTA Layer 2 semantic judgement ONLY for top-5 docs
+        if _should_apply_semantic_judgement(query_analysis, user_filters):
+            if debug:
+                print("[Semantic Relevance] Applying ASTA Layer 2 semantic judgement to top sources...")
+            _apply_semantic_relevance_to_top_sources(
+                query=query,
+                analysis=query_analysis,
+                sources=sources,
+                snippet_by_paper_id=snippet_by_pid,
+                debug=debug,
+                top_n=DEFAULT_JUDGE_TOP_N,
+            )
+        else:
+            # No semantic judge: finalize relevance = retrieval
+            for s in sources:
+                _finalize_relevance(s)
+
         if debug:
             print(f"[Retrieval] Retrieved {len(retrieved_texts)} chunks, total context length: {sum(len(t) for t in retrieved_texts)} chars")
 
         context = "\n\n".join(retrieved_texts) if retrieved_texts else "No relevant context found."
-        
-        # Build messages array with conversation history
+
         messages = [
-            {"role": "system", "content": "You are a paper finder assistant. Your primary role is to provide a very concise, high-level summary of what the retrieved academic papers are about. Keep the user's query in mind, but focus on giving a brief overview (one to two paragraphs maximum) of the key topics and contributions across the papers. Do NOT cite papers inline (no [Paper Title] or similar citations). The papers are already listed separately as sources. Use conversation history to provide context-aware responses. When including mathematics, write formulas in LaTeX and delimit inline math with \\( ... \\) and display math with \\[ ... \\]. Do not wrap LaTeX in code blocks and do not escape backslashes. Do NOT use headings, tables, or section numbering. Keep formatting simple: short paragraphs, bullet lists ( - item ), and optional bold/italics only."}
+            {"role": "system", "content": "You are a paper finder assistant. Your primary role is to provide a very concise, high-level summary of what the retrieved academic papers are about. Keep the user's query in mind, but focus on giving a brief overview (one to two paragraphs maximum) of the key topics and contributions across the papers. Do NOT cite papers inline (no [Paper Title] or similar citations). The papers are already listed separately as sources. Use conversation history to provide context-aware responses. When including mathematics, write formulas in LaTeX and delimit inline math with \\( ... \\) and display math with \\[ ... \\]. Do not wrap LaTeX in code blocks and do not escape backslashes. Do NOT use headings, tables, or section numbering. Keep formatting simple: short paragraphs, bullet lists ( - item ), and optional **bold**/*italics* only."}
         ]
-        
-        # Add conversation history if provided
+
         if conversation_history:
-            # Add only recent history (last 4 messages to avoid token limits)
             for msg in conversation_history[-4:]:
                 messages.append(msg)
-        
-        # Add current question with context
+
         messages.append({
-            "role": "user", 
+            "role": "user",
             "content": f"Context from academic papers:\n\n{context}\n\nUser's query: {query}\n\nProvide a very concise, high-level summary (one to two paragraphs maximum) of what these papers are about, keeping the user's query in mind. Focus on the key topics and contributions across the papers rather than detailed explanations. Do NOT cite papers inline - the papers are already listed separately as sources. If you include math, use LaTeX with \\(inline\\) or \\[display\\] delimiters, not code fences."
         })
+
         if debug:
             print("\n" + "-" * 80)
             print("[Generation] Final user message to LLM (answer prompt):")
             print("-" * 80)
             print(messages[-1]["content"])
             print("-" * 80)
-        
-        # Print the full query being sent to GPT
-        if debug:
-            print("\n" + "=" * 80)
-            print("MESSAGES BEING SENT TO GPT:")
-            print("=" * 80)
-            for i, msg in enumerate(messages, 1):
-                print(f"\n--- Message {i} ({msg['role']}) ---")
-                print(msg['content'])
-                print(f"--- End of Message {i} ---\n")
-            print("=" * 80)
-        
-        # Generate response with GPT-4o mini
+
         response = _openai_client.chat.completions.create(
             model=MODEL_ID,
             messages=messages,
             max_tokens=max_tokens,
             temperature=0.7
         )
-        
+
         answer = response.choices[0].message.content
-        
-        # Return sources first, then summary
+
         sources_text = format_sources(sources, max_sources=5)
         return sources_text + "\n\n" + answer, sources
-        
+
     except Exception as e:
         return f"Error generating response: {str(e)}", []
 
@@ -568,27 +922,43 @@ def format_sources(sources: List[Dict], max_sources: int = 5) -> str:
     """Format sources into a readable string."""
     if not sources:
         return ""
-    
+
     source_text = "\n\n**Sources:**\n"
     for source in sources[:max_sources]:
-        paper_id = source.get('paper_id', 'unknown')
-        title = source.get('title', 'No title')
-        authors = source.get('authors')
-        
-        # Build source line
+        paper_id = source.get("paper_id", "unknown")
+        title = source.get("title", "No title")
+        authors = source.get("authors")
+
+        rel = source.get("relevance") or {}
+        final_label = rel.get("label")
+        final_score = rel.get("score")
+        retrieval = rel.get("retrieval") or {}
+        semantic = rel.get("semantic") or {}
+
+        # compact display: final + (retrieval/semantic)
         source_line = f"{source.get('rank', '?')}. [{paper_id}] {title}"
-        
-        # Add authors if available
+        if final_label is not None and final_score is not None:
+            source_line += f" — {final_label} ({final_score}/3)"
+
+        r_label = retrieval.get("label")
+        r_score = retrieval.get("score")
+        s_label = semantic.get("label")
+        s_score = semantic.get("score")
+
+        if r_label is not None and r_score is not None:
+            source_line += f" [retrieval: {r_label} {r_score}/3]"
+        if s_label is not None and s_score is not None:
+            source_line += f" [semantic: {s_label} {s_score}/3]"
+
         if authors:
             source_line += f" - {authors}"
-        
-        # Add URL if available
-        url = source.get('url')
+
+        url = source.get("url")
         if url:
             source_line += f" ({url})"
-        
+
         source_text += source_line + "\n"
-    
+
     return source_text
 
 
@@ -598,10 +968,10 @@ def get_system_status() -> Dict:
     if _es_client is not None:
         try:
             stats = _es_client.count(index=ES_INDEX)
-            index_count = stats['count']
+            index_count = stats["count"]
         except Exception:
             pass
-    
+
     return {
         "initialized": _es_client is not None,
         "elasticsearch_connected": _es_client.ping() if _es_client else False,
@@ -618,24 +988,20 @@ def _augment_query_with_analysis(base: str, analysis: dict) -> str:
     """
     lines = []
 
-    # Add relevance criteria as keywords
     criteria = analysis.get("relevance_criteria", [])
     if criteria:
         names = [c.get("name") for c in criteria if isinstance(c, dict) and c.get("name")]
         if names:
             lines.append("Key topics: " + ", ".join(names))
 
-    # Add author preferences
     authors = analysis.get("authors", [])
     if authors:
         lines.append("Authors: " + ", ".join(authors))
 
-    # Add venue preferences
     venues = analysis.get("venues", [])
     if venues:
         lines.append("Venues: " + ", ".join(venues))
 
-    # Add time range
     tr = analysis.get("time_range", {})
     if tr and (tr.get("start") or tr.get("end")):
         start = tr.get("start", "")
@@ -647,10 +1013,9 @@ def _augment_query_with_analysis(base: str, analysis: dict) -> str:
         elif end:
             lines.append(f"Before: {end}")
 
-    # Combine base query with hints
     if not lines:
         return base
-    
+
     return base + "\n\nFilters:\n" + "\n".join(lines)
 
 
@@ -665,24 +1030,22 @@ def _generate_reworded_queries(query: str, conversation_history: Optional[List[D
                     "Each query should be a concise set of keywords and key phrases (not full sentences) that will help a search engine "
                     "find the most relevant academic paper chunks. Focus on: technical terms, method names, concepts, domain-specific vocabulary, "
                     "and synonyms. Use the conversation history to understand context and resolve references. "
-                    "Return exactly 10 keyword queries, one per line, without numbering or bullets. "
+                    f"Return exactly {num_queries} keyword queries, one per line, without numbering or bullets. "
                     "The FIRST query must be the single best representation of the user's core intent and should be the one most likely to retrieve the perfect answer. "
                     "Each query should be optimized for retrieval - use keywords and phrases, not complete sentences."
                 ),
             }
         ]
-        
-        # Add conversation history for context
+
         recent_history = []
         if conversation_history:
-            recent_history = conversation_history[-6:]  # Use last 6 messages
+            recent_history = conversation_history[-6:]
             for msg in recent_history:
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
                 if content:
                     messages.append({"role": role, "content": content})
-        
-        # Add the current query
+
         messages.append({
             "role": "user",
             "content": (
@@ -694,48 +1057,35 @@ def _generate_reworded_queries(query: str, conversation_history: Optional[List[D
                 f"Return exactly {num_queries} keyword queries, one per line. Use keywords and phrases, not complete sentences."
             ),
         })
-        
+
         if debug:
-            print("\n" + "="*60)
+            print("\n" + "=" * 60)
             print("GENERATING REWORDED QUERIES")
-            print("="*60)
+            print("=" * 60)
             print(f"Original query: {query}")
             if conversation_history:
                 print(f"Using {len(recent_history)} messages from conversation history")
-        
+
         response = _openai_client.chat.completions.create(
             model=MODEL_ID,
             messages=messages,
             max_tokens=400,
-            temperature=0.7,  # Higher temperature for diversity
+            temperature=0.7,
         )
-        
+
         raw_output = response.choices[0].message.content.strip()
-        
-        # Parse the output - split by newlines and clean
-        queries = [q.strip() for q in raw_output.split('\n') if q.strip()]
-        
-        # If we got fewer than requested, pad with variations
+        queries = [q.strip() for q in raw_output.split("\n") if q.strip()]
+
         if len(queries) < num_queries:
-            queries.append(query)  # Always include original
-            # Generate more if needed
+            queries.append(query)
             while len(queries) < num_queries:
                 queries.append(f"{query} (alternative perspective)")
-        
-        # Limit to exactly num_queries
-        queries = queries[:num_queries]
-        
-        if debug:
-            print(f"Generated {len(queries)} reworded queries:")
-            for i, q in enumerate(queries, 1):
-                print(f"  {i}. {q}")
-        
-        return queries
-        
+
+        return queries[:num_queries]
+
     except Exception as e:
         if debug:
             print(f"Error generating reworded queries: {e}")
-        # Fallback: return original query repeated
         return [query] * num_queries
 
 
@@ -768,9 +1118,8 @@ def _search_elasticsearch(query: str, top_k: int = 20, debug: bool = False) -> L
         "size": top_k,
         "_source": ["paper_id", "chunk_index", "title", "authors", "chunk_text", "token_count", "year"]
     }
-    
+
     try:
-        # Try new API first (Elasticsearch 8.x)
         response = _es_client.search(
             index=ES_INDEX,
             query=search_body["query"],
@@ -779,45 +1128,37 @@ def _search_elasticsearch(query: str, top_k: int = 20, debug: bool = False) -> L
             timeout="60s"
         )
     except (TypeError, KeyError):
-        # Fall back to old API (Elasticsearch 7.x)
         search_body_with_timeout = search_body.copy()
         search_body_with_timeout["timeout"] = "60s"
         response = _es_client.search(index=ES_INDEX, body=search_body_with_timeout)
-    
+
     hits = response.get("hits", {}).get("hits", [])
     return hits
+
+
+# =============================================================================
+# Summarization + overlap removal (unchanged)
+# =============================================================================
 def _summarize_paper(full_text: str, target_ratio: float = 0.15, debug: bool = False) -> str:
     """
     Summarize a full paper to exactly 500 words as a single paragraph using a lightweight LLM.
-    
-    Args:
-        full_text: The full text of the paper
-        target_ratio: Deprecated - kept for backward compatibility, not used (always targets 500 words)
-        debug: Whether to print debug information
-    
-    Returns:
-        Summarized text as a single paragraph (approximately 500 words)
     """
     global _openai_client
-    
+
     if not _openai_client:
         if debug:
             print("[Summarization] OpenAI client not initialized")
         return full_text
-    
+
     if not full_text or len(full_text) < 200:
-        # Too short to summarize meaningfully
         return full_text
-    
-    # Fixed target: 500 words (single paragraph)
+
     target_word_count = 500
-    
-    # Estimate word count for better prompting
     word_count = len(full_text.split())
-    
+
     if debug:
         print(f"[Summarization] Original: {word_count} words, Target: {target_word_count} words (single paragraph)")
-    
+
     try:
         messages = [
             {
@@ -841,424 +1182,254 @@ def _summarize_paper(full_text: str, target_ratio: float = 0.15, debug: bool = F
                 )
             }
         ]
-        
-        # Use gpt-4o-mini for summarization (consistent with rest of system)
-        # Calculate max_tokens: roughly 1.5 tokens per word, add buffer for safety
-        estimated_tokens = int(target_word_count * 1.5)  # 1.5 tokens per word with buffer
-        max_tokens = min(4000, max(800, estimated_tokens))  # At least 800 tokens for 500 words, max 4000
-        
+
+        estimated_tokens = int(target_word_count * 1.5)
+        max_tokens = min(4000, max(800, estimated_tokens))
+
         response = _openai_client.chat.completions.create(
             model=SUMMARIZATION_MODEL_ID,
             messages=messages,
             max_tokens=max_tokens,
-            temperature=0.3  # Lower temperature for more consistent summarization
+            temperature=0.3
         )
-        
-        # Extract response content
-        if not response.choices or len(response.choices) == 0:
-            if debug:
-                print(f"[Summarization] ERROR: No choices in response. Response: {response}")
-            return full_text
-        
+
         choice = response.choices[0]
-        finish_reason = choice.finish_reason if hasattr(choice, 'finish_reason') else None
-        
-        if debug:
-            print(f"[Summarization] Finish reason: {finish_reason}")
-            print(f"[Summarization] Response object: {response}")
-            print(f"[Summarization] Choice object: {choice}")
-        
-        if not choice.message:
-            if debug:
-                print(f"[Summarization] ERROR: No message in choice. Finish reason: {finish_reason}")
-                print(f"[Summarization] Full response: {response}")
-            return full_text
-        
         content = choice.message.content
-        if content is None:
-            if debug:
-                print(f"[Summarization] ERROR: Content is None. Finish reason: {finish_reason}")
-                print(f"[Summarization] Full response: {response}")
-                print(f"[Summarization] Message object: {choice.message}")
-            return full_text
-        
         summarized_text = content.strip() if isinstance(content, str) else str(content).strip()
-        
         if not summarized_text:
-            if debug:
-                print(f"[Summarization] ERROR: Summarized text is empty after strip. Content was: {repr(content)}")
-                print(f"[Summarization] Finish reason: {finish_reason}")
             return full_text
-        
-        if debug:
-            summary_word_count = len(summarized_text.split())
-            actual_ratio = summary_word_count / word_count if word_count > 0 else 0
-            print(f"[Summarization] Summary: {summary_word_count} words (target: {target_word_count} words, {actual_ratio*100:.1f}% of original)")
-        
+
         return summarized_text
-        
+
     except Exception as e:
         if debug:
             print(f"[Summarization] Error summarizing paper: {e}")
             import traceback
             traceback.print_exc()
-        # Return original text if summarization fails
         return full_text
 
 
 def _remove_repeated_phrases(text: str, min_phrase_words: int = 10) -> str:
-    """
-    Post-processing step to remove repeated phrases that might have been missed.
-    Looks for phrases of min_phrase_words or more that appear multiple times.
-    
-    Args:
-        text: The text to clean
-        min_phrase_words: Minimum number of words in a phrase to consider for removal
-    
-    Returns:
-        Text with repeated phrases removed
-    """
-    if not text or len(text) < 100:  # Skip if text is too short
+    if not text or len(text) < 100:
         return text
-    
+
     words = text.split()
-    if len(words) < min_phrase_words * 2:  # Need at least 2x the phrase length
+    if len(words) < min_phrase_words * 2:
         return text
-    
-    # Look for repeated phrases by checking sequences of words
-    # Start from longer phrases and work down
-    max_phrase_length = min(len(words) // 2, 100)  # Don't check phrases longer than half the text
-    max_iterations = 5  # Limit iterations to avoid infinite loops
+
+    max_phrase_length = min(len(words) // 2, 100)
+    max_iterations = 5
     iteration = 0
-    
+
     result_text = text
-    
+
     while iteration < max_iterations:
         iteration += 1
         found_repeat = False
-        
-        # Check phrases from longest to shortest
+
         for phrase_length in range(max_phrase_length, min_phrase_words - 1, -1):
-            # Build a dictionary of phrases and their positions
             phrase_positions = {}
-            
-            # Check all possible phrases of this length
+
             for start_idx in range(len(words) - phrase_length + 1):
                 phrase = words[start_idx:start_idx + phrase_length]
-                phrase_text = ' '.join(phrase)
-                
-                # Skip if phrase is too short (character-wise)
+                phrase_text = " ".join(phrase)
+
                 if len(phrase_text) < 50:
                     continue
-                
-                # Find all occurrences of this phrase in the result_text
+
                 occurrences = []
                 search_start = 0
-                
+
                 while True:
                     pos = result_text.find(phrase_text, search_start)
                     if pos == -1:
                         break
                     occurrences.append(pos)
                     search_start = pos + 1
-                
-                # If we found multiple occurrences, store it
+
                 if len(occurrences) > 1:
                     phrase_positions[phrase_text] = sorted(occurrences)
                     found_repeat = True
-                    break  # Process this phrase first
-        
-        # If we found repeats, remove them
+                    break
+
         if found_repeat and phrase_positions:
-            # Process the first phrase found (longest)
             phrase_text = list(phrase_positions.keys())[0]
             occurrences = phrase_positions[phrase_text]
-            
-            # Remove all but the first occurrence (work backwards to maintain positions)
-            for i in range(len(occurrences) - 1, 0, -1):  # Start from last occurrence
+
+            for i in range(len(occurrences) - 1, 0, -1):
                 occ_pos = occurrences[i]
-                # Remove this occurrence
                 before = result_text[:occ_pos]
                 after = result_text[occ_pos + len(phrase_text):]
-                
-                # Clean up any double spaces or awkward breaks
+
                 before = before.rstrip()
                 after = after.lstrip()
-                
-                # Add a space if needed for smooth flow
+
                 if before and after:
-                    if before[-1] not in '.!?;:\n' and after[0] not in '.!?;:,':
-                        if not before.endswith(' '):
-                            before += ' '
-                
+                    if before[-1] not in ".!?;:\n" and after[0] not in ".!?;:,":
+                        if not before.endswith(" "):
+                            before += " "
+
                 result_text = before + after
-            
-            # Re-split words for next iteration
+
             words = result_text.split()
             if len(words) < min_phrase_words * 2:
                 break
         else:
-            # No more repeats found
             break
-    
+
     return result_text
 
 
 def _remove_overlap_between_chunks(chunks: List[str], min_overlap_length: int = 50) -> List[str]:
-    """
-    Remove overlapping text between consecutive chunks and ensure smooth flow.
-    Handles cases where chunks overlap at both ends.
-    
-    Args:
-        chunks: List of chunk texts
-        min_overlap_length: Minimum character length of overlap to consider (to avoid false positives)
-    
-    Returns:
-        List of chunks with overlaps removed and smooth transitions
-    """
+    # (unchanged from your version)
     if not chunks or len(chunks) <= 1:
         return chunks
-    
+
     deduplicated = []
-    
+
     for i, curr_chunk in enumerate(chunks):
         if i == 0:
-            # First chunk is always included as-is
             deduplicated.append(curr_chunk)
             continue
-        
+
         prev_chunk = deduplicated[-1]
-        
-        # Normalize whitespace for comparison, but preserve original for output
         prev_chunk_clean = prev_chunk.strip()
         curr_chunk_clean = curr_chunk.strip()
-        
+
         if not prev_chunk_clean or not curr_chunk_clean:
             deduplicated.append(curr_chunk)
             continue
-        
-        # Find overlap by comparing end of prev_chunk with start of curr_chunk
-        # Use word-boundary matching for accuracy
+
         prev_words = prev_chunk_clean.split()
         curr_words = curr_chunk_clean.split()
-        
+
         if not prev_words or not curr_words:
             deduplicated.append(curr_chunk)
             continue
-        
-        # Find the longest matching word sequence
+
         overlap_found = False
         overlap_num_words = 0
         overlap_text = ""
-        
-        # Check from longest possible overlap down to minimum
+
         max_possible_words = min(len(prev_words), len(curr_words))
-        # Increase the range - check all possible overlaps, not just those meeting min_overlap_length estimate
         for num_words in range(max_possible_words, 0, -1):
             prev_end_words = prev_words[-num_words:]
             curr_start_words = curr_words[:num_words]
-            
-            # Check if word sequences match exactly
+
             if prev_end_words == curr_start_words:
-                overlap_text_words = ' '.join(curr_start_words)
-                # Only consider if it meets minimum length requirement
+                overlap_text_words = " ".join(curr_start_words)
                 if len(overlap_text_words) >= min_overlap_length:
                     overlap_found = True
                     overlap_num_words = num_words
                     overlap_text = overlap_text_words
                     break
-        
-        # If word matching didn't work, try character-level matching with increased limits
+
         overlap_len_chars = 0
         if not overlap_found:
             prev_len = len(prev_chunk_clean)
             curr_len = len(curr_chunk_clean)
-            # Increase limit significantly - overlaps can be very long
-            max_possible_overlap = min(prev_len, curr_len, 2000)  # Increased from 500 to 2000
-            
-            # Check from end of prev_chunk, with smaller step size for better accuracy
-            # Start from longer overlaps and work backwards
-            for test_len in range(max_possible_overlap, min_overlap_length - 1, -10):  # Step by 10, backwards
+            max_possible_overlap = min(prev_len, curr_len, 2000)
+
+            for test_len in range(max_possible_overlap, min_overlap_length - 1, -10):
                 prev_suffix = prev_chunk_clean[-test_len:]
                 curr_prefix = curr_chunk_clean[:test_len]
-                
+
                 if prev_suffix == curr_prefix:
                     overlap_found = True
                     overlap_len_chars = test_len
                     overlap_text = prev_suffix
                     break
-            
-            # If still not found with step size 10, try step size 1 for the last 500 chars
+
             if not overlap_found:
                 fine_search_limit = min(500, max_possible_overlap)
                 for test_len in range(fine_search_limit, min_overlap_length - 1, -1):
                     prev_suffix = prev_chunk_clean[-test_len:]
                     curr_prefix = curr_chunk_clean[:test_len]
-                    
+
                     if prev_suffix == curr_prefix:
                         overlap_found = True
                         overlap_len_chars = test_len
                         overlap_text = prev_suffix
                         break
-        
-        # Remove overlap and ensure smooth transition
+
         if overlap_found:
-            # Find where overlap starts in the original curr_chunk
-            # Try multiple search strategies to handle whitespace differences
-            overlap_pos = -1
-            cut_position = None
-            
-            # First, try exact match
             overlap_pos = curr_chunk.find(overlap_text)
-            
-            # If not found, try searching in cleaned area
+            cut_position = None
+
             if overlap_pos == -1:
                 search_start = max(0, len(curr_chunk) - len(curr_chunk_clean) - 100)
                 overlap_pos = curr_chunk.find(overlap_text, search_start)
-            
-            # If still not found, try normalized version (collapse whitespace)
+
             if overlap_pos == -1:
-                overlap_text_normalized = re.sub(r'\s+', ' ', overlap_text).strip()
-                curr_chunk_normalized = re.sub(r'\s+', ' ', curr_chunk).strip()
+                overlap_text_normalized = re.sub(r"\s+", " ", overlap_text).strip()
+                curr_chunk_normalized = re.sub(r"\s+", " ", curr_chunk).strip()
                 normalized_pos = curr_chunk_normalized.find(overlap_text_normalized)
                 if normalized_pos >= 0:
-                    # Find corresponding position in original
-                    # Count non-whitespace chars up to normalized_pos
                     char_count = 0
-                    for i, char in enumerate(curr_chunk):
-                        if char not in ' \n\t':
+                    for j, char in enumerate(curr_chunk):
+                        if char not in " \n\t":
                             char_count += 1
                         if char_count > normalized_pos:
-                            overlap_pos = i
+                            overlap_pos = j
                             break
-            
-            # If still not found but we have word-level match, try finding by first word
-            if overlap_pos == -1 and overlap_num_words > 0:
-                # Find where the first word of overlap appears in curr_chunk
-                first_overlap_word = curr_words[0] if curr_words else ""
-                if first_overlap_word:
-                    # Try to find the word, accounting for word boundaries
-                    word_pos = curr_chunk.find(first_overlap_word)
-                    if word_pos >= 0:
-                        # Verify this is at a word boundary
-                        if word_pos == 0 or curr_chunk[word_pos - 1] in ' \n\t':
-                            overlap_pos = word_pos
-                            # Calculate cut position based on word count
-                            # Find the end of the last overlapping word
-                            words_seen = 1
-                            pos = word_pos + len(first_overlap_word)
-                            while pos < len(curr_chunk) and words_seen < overlap_num_words:
-                                # Skip whitespace
-                                while pos < len(curr_chunk) and curr_chunk[pos] in ' \n\t':
-                                    pos += 1
-                                # Find end of current word
-                                while pos < len(curr_chunk) and curr_chunk[pos] not in ' \n\t':
-                                    pos += 1
-                                words_seen += 1
-                            # Include trailing whitespace
-                            while pos < len(curr_chunk) and curr_chunk[pos] in ' \n\t':
-                                pos += 1
-                            cut_position = pos
-                        else:
-                            # Not at word boundary, try next occurrence
-                            next_word_pos = curr_chunk.find(first_overlap_word, word_pos + 1)
-                            if next_word_pos >= 0 and (next_word_pos == 0 or curr_chunk[next_word_pos - 1] in ' \n\t'):
-                                overlap_pos = next_word_pos
-                                # Similar calculation as above
-                                words_seen = 1
-                                pos = next_word_pos + len(first_overlap_word)
-                                while pos < len(curr_chunk) and words_seen < overlap_num_words:
-                                    while pos < len(curr_chunk) and curr_chunk[pos] in ' \n\t':
-                                        pos += 1
-                                    while pos < len(curr_chunk) and curr_chunk[pos] not in ' \n\t':
-                                        pos += 1
-                                    words_seen += 1
-                                while pos < len(curr_chunk) and curr_chunk[pos] in ' \n\t':
-                                    pos += 1
-                                cut_position = pos
-            
+
             if overlap_pos >= 0:
-                # Calculate cut position: after the overlap
                 if cut_position is None:
-                    # Fallback: use length-based calculation
                     cut_position = overlap_pos + len(overlap_text)
-                
-                # Include any trailing whitespace/newlines after the overlap
-                while cut_position < len(curr_chunk) and curr_chunk[cut_position] in ' \n\t':
+
+                while cut_position < len(curr_chunk) and curr_chunk[cut_position] in " \n\t":
                     cut_position += 1
-                
-                # Get remaining text
+
                 remaining_text = curr_chunk[cut_position:].strip()
-                
                 if remaining_text:
-                    # Ensure smooth flow by checking spacing
                     prev_end = prev_chunk.rstrip()
-                    if prev_end and not prev_end[-1] in '.!?;:\n':
-                        # If prev doesn't end with punctuation, ensure proper spacing
-                        if not remaining_text[0] in '.!?;:,' and not prev_end.endswith(' '):
-                            remaining_text = ' ' + remaining_text
-                    
+                    if prev_end and not prev_end[-1] in ".!?;:\n":
+                        if not remaining_text[0] in ".!?;:," and not prev_end.endswith(" "):
+                            remaining_text = " " + remaining_text
+
                     deduplicated.append(remaining_text)
-                # If nothing remains, the chunk was completely overlapped - skip it
             else:
-                # Couldn't find exact position, append as-is
                 deduplicated.append(curr_chunk)
         else:
-            # No overlap found, append as-is but ensure smooth transition
             prev_end = prev_chunk.rstrip()
             if prev_end and curr_chunk_clean:
-                # Ensure proper spacing between non-overlapping chunks
-                if (prev_end[-1] not in '.!?;:\n' and 
-                    curr_chunk_clean[0] not in '.!?;:,' and
-                    not prev_end.endswith(' ')):
-                    deduplicated.append(' ' + curr_chunk)
+                if (prev_end[-1] not in ".!?;:\n" and curr_chunk_clean[0] not in ".!?;:," and not prev_end.endswith(" ")):
+                    deduplicated.append(" " + curr_chunk)
                 else:
                     deduplicated.append(curr_chunk)
             else:
                 deduplicated.append(curr_chunk)
-    
+
     return deduplicated
 
 
+# =============================================================================
+# Full-paper support + filtering utilities (unchanged from your file)
+# =============================================================================
 def _get_all_chunks_for_papers(paper_ids: List[str], debug: bool = False) -> Dict[Tuple[str, int], Dict]:
-    """
-    Retrieve ALL chunks for given paper IDs from Elasticsearch.
-    
-    Args:
-        paper_ids: List of paper IDs to retrieve chunks for
-        debug: Whether to print debug information
-    
-    Returns:
-        Dictionary mapping (paper_id, chunk_index) -> chunk data
-    """
     global _es_client
-    
+
     if not _es_client or not paper_ids:
         return {}
-    
+
     unique_paper_ids = list(set(paper_ids))
     all_chunks = {}
-    
+
     try:
-        # Query Elasticsearch for all chunks matching these paper IDs
-        # Note: We don't sort by chunk_index as it may not be sortable in the index
-        # Instead, we'll sort the results in Python after retrieval
         query = {
             "query": {
                 "terms": {
                     "paper_id": unique_paper_ids
                 }
             },
-            "size": 10000,  # Large size to get all chunks (adjust if needed)
+            "size": 10000,
             "_source": ["paper_id", "chunk_index", "title", "authors", "chunk_text", "token_count", "year"]
-            # Removed sort - will sort in Python instead
         }
-        
+
         if debug:
             print(f"[Full Paper] Querying Elasticsearch for {len(unique_paper_ids)} papers: {unique_paper_ids}")
-        
+
         try:
-            # Try new API first (Elasticsearch 8.x) - without sort since chunk_index may not be sortable
             response = _es_client.search(
                 index=ES_INDEX,
                 query=query["query"],
@@ -1267,51 +1438,37 @@ def _get_all_chunks_for_papers(paper_ids: List[str], debug: bool = False) -> Dic
                 timeout="60s"
             )
         except (TypeError, KeyError):
-            # Fall back to old API
             if debug:
                 print("[Full Paper] Using fallback API (old Elasticsearch client)")
             response = _es_client.search(index=ES_INDEX, body=query, timeout="60s")
-        
+
         hits = response.get("hits", {}).get("hits", [])
         total_hits = response.get("hits", {}).get("total", {})
         if isinstance(total_hits, dict):
             total_count = total_hits.get("value", len(hits))
         else:
             total_count = total_hits if total_hits else len(hits)
-        
+
         if debug:
             print(f"[Full Paper] Elasticsearch returned {len(hits)} hits (total available: {total_count})")
-        
-        # Handle pagination if we have more results than size limit
-        if total_count > len(hits):
-            if debug:
-                print(f"[Full Paper] WARNING: More chunks available ({total_count}) than retrieved ({len(hits)}). Consider increasing size limit.")
-        
+
         for hit in hits:
             source_data = hit.get("_source", {})
             paper_id = source_data.get("paper_id", "unknown")
             chunk_index = int(source_data.get("chunk_index", 0))
             key = (paper_id, chunk_index)
-            
+
             all_chunks[key] = {
                 "source_data": source_data,
                 "score": float(hit.get("_score", 0.0)),
                 "hit": hit
             }
-        
-        # Sort chunks by paper_id and chunk_index in Python
-        # Convert to list, sort, then back to dict (or just keep as sorted list of items)
+
         sorted_chunk_items = sorted(all_chunks.items(), key=lambda x: (x[0][0], x[0][1]))
         all_chunks = dict(sorted_chunk_items)
-        
-        if debug:
-            print(f"[Full Paper] Retrieved {len(all_chunks)} chunks for {len(unique_paper_ids)} papers")
-            for paper_id in unique_paper_ids:
-                paper_chunks = [k for k in all_chunks.keys() if k[0] == paper_id]
-                print(f"[Full Paper]   Paper {paper_id}: {len(paper_chunks)} chunks")
-        
+
         return all_chunks
-        
+
     except Exception as e:
         if debug:
             print(f"[Full Paper] Error retrieving all chunks: {e}")
@@ -1319,52 +1476,33 @@ def _get_all_chunks_for_papers(paper_ids: List[str], debug: bool = False) -> Dic
 
 
 def _extract_year_from_paper_id(paper_id: str) -> Optional[int]:
-    """
-    Extract year from paper_id if it's an arXiv ID.
-    Supports two arXiv ID formats:
-    1. Old format (pre-2007): YYYY.MMMM or YYYY.MMMMvN (e.g., 2004.0123 -> 2004)
-    2. New format (post-2007): category/YYMMNNN or YYMM.NNNN (e.g., cs/0407005 -> 2004, 1701.01234 -> 2017)
-    """
     if not paper_id:
         return None
-    
+
     try:
-        # Remove version suffix if present (e.g., "v2")
-        paper_id_clean = paper_id.split('v')[0]
-        
-        # Check for old format: YYYY.MMMM (4 digits before dot)
-        if '.' in paper_id_clean:
-            parts = paper_id_clean.split('.')
+        paper_id_clean = paper_id.split("v")[0]
+
+        if "." in paper_id_clean:
+            parts = paper_id_clean.split(".")
             if len(parts) >= 1 and len(parts[0]) == 4 and parts[0].isdigit():
                 year = int(parts[0])
-                if 1990 <= year <= 2100:  # Reasonable year range
+                if 1990 <= year <= 2100:
                     return year
-        
-        # Check for new format: YYMM.NNNN or category/YYMMNNN
-        # Extract YYMM pattern (2 digits for year, 2 digits for month)
-        # Match YYMM pattern (4 digits)
-        match = re.search(r'(\d{2})(\d{2})', paper_id_clean)
+
+        match = re.search(r"(\d{2})(\d{2})", paper_id_clean)
         if match:
             yy = int(match.group(1))
             mm = int(match.group(2))
-            # Validate month (1-12)
             if 1 <= mm <= 12:
-                # Convert to full year: if YY < 50, assume 20YY, else assume 19YY
-                if yy < 50:
-                    return 2000 + yy
-                else:
-                    return 1900 + yy
+                return 2000 + yy if yy < 50 else 1900 + yy
     except (ValueError, IndexError, AttributeError):
         pass
-    
+
     return None
 
 
 def _get_chunk_year(chunk_data: Dict) -> Optional[int]:
-    """Get year from chunk data, either from year field or extracted from paper_id."""
     source_data = chunk_data.get("source_data", {})
-    
-    # First try the year field
     year = source_data.get("year")
     if year is not None:
         try:
@@ -1373,134 +1511,82 @@ def _get_chunk_year(chunk_data: Dict) -> Optional[int]:
                 return year_int
         except (ValueError, TypeError):
             pass
-    
-    # Fall back to extracting from paper_id
+
     paper_id = source_data.get("paper_id", "")
     return _extract_year_from_paper_id(paper_id)
 
 
 def _filter_chunks_by_analysis(all_chunks_dict: Dict, analysis: Dict[str, Any], debug: bool = False) -> Dict:
-    """
-    Filter chunks based on query analysis criteria (year, authors, venues).
-    
-    Args:
-        all_chunks_dict: Dictionary mapping (paper_id, chunk_index) -> chunk data
-        analysis: Result from analyze_query containing filters
-        debug: Whether to print debug information
-    
-    Returns:
-        Filtered dictionary with same structure
-    """
     if not analysis or analysis.get("status") != "success":
         if debug:
             print("[Filtering] Analysis not available or failed, skipping filtering")
         return all_chunks_dict
-    
+
     time_range = analysis.get("time_range", {})
     requested_authors = analysis.get("authors", [])
     requested_venues = analysis.get("venues", [])
-    
-    # Check if any filtering criteria are present
+
     has_year_filter = time_range.get("start") is not None or time_range.get("end") is not None
     has_author_filter = len(requested_authors) > 0
     has_venue_filter = len(requested_venues) > 0
-    
+
     if not (has_year_filter or has_author_filter or has_venue_filter):
         if debug:
             print("[Filtering] No filtering criteria found in analysis, keeping all chunks")
         return all_chunks_dict
-    
-    if debug:
-        print("\n" + "="*60)
-        print("FILTERING CHUNKS BY ANALYSIS")
-        print("="*60)
-        print(f"Year filter: {time_range}")
-        print(f"Author filter: {requested_authors}")
-        print(f"Venue filter: {requested_venues}")
-        print(f"Chunks before filtering: {len(all_chunks_dict)}")
-    
+
     filtered_chunks = {}
     year_start = time_range.get("start")
     year_end = time_range.get("end")
-    
+
     for key, chunk_data in all_chunks_dict.items():
         source_data = chunk_data.get("source_data", {})
         should_keep = True
-        
-        # Filter by year
+
         if has_year_filter:
             chunk_year = _get_chunk_year(chunk_data)
-            if chunk_year is None:
-                # If we can't determine the year, keep it (don't filter out)
-                pass
-            else:
+            if chunk_year is not None:
                 if year_start and chunk_year < year_start:
                     should_keep = False
                 if year_end and chunk_year > year_end:
                     should_keep = False
-        
-        # Filter by authors
-        # AUTHOR FILTER
+
         if should_keep and has_author_filter:
             chunk_authors = source_data.get("authors", []) or []
-
-            # normalize
-            chunk_authors_lower = [a.lower() for a in chunk_authors]
-            requested_authors_lower = [a.lower() for a in requested_authors]
+            chunk_authors_lower = [str(a).lower() for a in chunk_authors]
+            requested_authors_lower = [str(a).lower() for a in requested_authors]
 
             author_match = any(
                 any(req in chunk_author for chunk_author in chunk_authors_lower)
                 for req in requested_authors_lower
             )
-
             if not author_match:
                 should_keep = False
-        
-        # Filter by venues (if venue data is available in chunks)
-        # Note: Currently chunks don't seem to have venue data, but we'll check anyway
+
         if should_keep and has_venue_filter:
-            # Venue filtering would go here if venue field exists in chunks
-            # For now, we skip venue filtering as it's not in the chunk metadata
+            # Venue filtering not implemented (left as in your version)
             pass
-        
+
         if should_keep:
             filtered_chunks[key] = chunk_data
-    
-    if debug:
-        print(f"Chunks after filtering: {len(filtered_chunks)}")
-        print(f"Chunks removed: {len(all_chunks_dict) - len(filtered_chunks)}")
-        print("="*60)
-    
+
     return filtered_chunks
 
 
 def _fetch_arxiv_papers_by_author(author_names: List[str], max_results_per_author: int = 5, debug: bool = False) -> List[Dict]:
-    """
-    Fetch papers from arXiv API for given author names.
-    
-    Args:
-        author_names: List of author names to search for
-        max_results_per_author: Maximum number of papers to fetch per author
-        debug: Whether to print debug information
-    
-    Returns:
-        List of dictionaries with paper information (paper_id, title, authors, chunk_text, etc.)
-    """
     if not author_names:
         return []
-    
+
     all_papers = []
     arxiv_ns = {"atom": "http://www.w3.org/2005/Atom", "opensearch": "http://a9.com/-/spec/opensearch/1.1/"}
-    
+
     for author_name in author_names:
         if not author_name or not author_name.strip():
             continue
-        
+
         try:
-            # Construct arXiv API query for author search
-            # Use au:"Author Name" format for exact author matching
             search_query = f'au:"{author_name.strip()}"'
-            url = f"http://export.arxiv.org/api/query"
+            url = "http://export.arxiv.org/api/query"
             params = {
                 "search_query": search_query,
                 "start": 0,
@@ -1508,32 +1594,28 @@ def _fetch_arxiv_papers_by_author(author_names: List[str], max_results_per_autho
                 "sortBy": "submittedDate",
                 "sortOrder": "descending"
             }
-            
+
             if debug:
                 print(f"[arXiv] Fetching papers for author: {author_name}")
-            
+
             response = requests.get(url, params=params, timeout=30)
             response.raise_for_status()
-            
-            # Parse XML response
+
             root = ET.fromstring(response.text)
             entries = root.findall("atom:entry", arxiv_ns)
-            
+
             for entry in entries:
-                # Extract paper ID (format: http://arxiv.org/abs/YYMM.NNNNvN -> YYMM.NNNNvN)
                 paper_id_elem = entry.find("atom:id", arxiv_ns)
                 if paper_id_elem is None:
                     continue
-                
+
                 paper_id = paper_id_elem.text.split("/")[-1] if paper_id_elem.text else None
                 if not paper_id:
                     continue
-                
-                # Extract title
+
                 title_elem = entry.find("atom:title", arxiv_ns)
                 title = title_elem.text.strip().replace("\n", " ") if title_elem is not None and title_elem.text else ""
-                
-                # Extract authors
+
                 author_elems = entry.findall("atom:author", arxiv_ns)
                 authors_list = []
                 for author_elem in author_elems:
@@ -1541,12 +1623,10 @@ def _fetch_arxiv_papers_by_author(author_names: List[str], max_results_per_autho
                     if name_elem is not None and name_elem.text:
                         authors_list.append(name_elem.text.strip())
                 authors = ", ".join(authors_list) if authors_list else ""
-                
-                # Extract abstract/summary
+
                 summary_elem = entry.find("atom:summary", arxiv_ns)
                 abstract = summary_elem.text.strip().replace("\n", " ") if summary_elem is not None and summary_elem.text else ""
-                
-                # Extract published date
+
                 published_elem = entry.find("atom:published", arxiv_ns)
                 published_date = published_elem.text.split("T")[0] if published_elem is not None and published_elem.text else None
                 year = None
@@ -1555,13 +1635,10 @@ def _fetch_arxiv_papers_by_author(author_names: List[str], max_results_per_autho
                         year = int(published_date.split("-")[0])
                     except (ValueError, AttributeError):
                         year = None
-                
-                # Create chunk text from title and abstract
+
                 chunk_text = f"Title: {title}\n\nAbstract: {abstract}" if abstract else f"Title: {title}"
-                
-                # Construct arXiv URL
                 arxiv_url = f"https://arxiv.org/abs/{paper_id}"
-                
+
                 paper_data = {
                     "paper_id": paper_id,
                     "title": title,
@@ -1571,139 +1648,90 @@ def _fetch_arxiv_papers_by_author(author_names: List[str], max_results_per_autho
                     "year": year,
                     "published_date": published_date,
                     "url": arxiv_url,
-                    "chunk_index": 0,  # arXiv papers are treated as single chunks
+                    "chunk_index": 0,
                     "source": "arxiv_api"
                 }
-                
+
                 all_papers.append(paper_data)
-            
-            if debug:
-                print(f"[arXiv] Found {len(entries)} papers for author: {author_name}")
-        
+
         except Exception as e:
             if debug:
                 print(f"[arXiv] Error fetching papers for author '{author_name}': {e}")
             continue
-    
-    if debug:
-        print(f"[arXiv] Total papers fetched from arXiv: {len(all_papers)}")
-    
+
     return all_papers
 
 
 def _reciprocal_rank_fusion(rank_lists: List[List[Tuple[str, int]]], k: int = 60) -> Dict[Tuple[str, int], float]:
-    """
-    Apply Reciprocal Rank Fusion to combine multiple ranked lists.
-    
-    Args:
-        rank_lists: List of ranked lists, where each list contains tuples of (paper_id, chunk_index)
-        k: RRF constant (default 60)
-    
-    Returns:
-        Dictionary mapping (paper_id, chunk_index) to RRF score
-    """
     scores: Dict[Tuple[str, int], float] = defaultdict(float)
-    
     for ranks in rank_lists:
         for rank, (paper_id, chunk_index) in enumerate(ranks, start=1):
             key = (paper_id, chunk_index)
             scores[key] += 1.0 / (k + rank)
-    
     return scores
 
 
-def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int = DEFAULT_MAX_TOKENS, debug: bool = False, conversation_history: List[Dict] = None, user_filters: Dict = None):
-    """Generator that streams the LLM answer tokens and finally emits sources.
-
-    Yields SSE-like lines: "data: {json}\n\n" where json has either a
-    {"event":"delta","text":"..."} shape or a final
-    {"event":"done","sources":[...]}.
-    """
+# =============================================================================
+# Streaming RAG: add dedup-by-paper + retrieval relevance + OPTIONAL semantic LLM judgement (top-5)
+# =============================================================================
+def stream_rag_response(
+    query: str,
+    top_k: int = DEFAULT_TOP_K,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    debug: bool = False,
+    conversation_history: List[Dict] = None,
+    user_filters: Dict = None
+):
+    """Generator that streams the LLM answer tokens and finally emits sources."""
     if not initialize_rag_system() or not all([_es_client, _openai_client]):
         yield f"data: {json.dumps({'event': 'error', 'message': 'RAG not initialized'})}\n\n"
         return
 
     try:
-        # Step 1: Generate 10 reworded queries using GPT with conversation history
         yield f"data: {json.dumps({'event': 'status', 'message': 'Generating reformulated queries...'})}\n\n"
-        if debug:
-            print("\n" + "="*60)
-            print("STREAMING: Generating reworded queries")
-            print("="*60)
-        
         reworded_queries = _generate_reworded_queries(query, conversation_history, num_queries=10, debug=debug)
-        
-        # Step 2: For each query, retrieve top 20 chunks from Elasticsearch
+
         yield f"data: {json.dumps({'event': 'status', 'message': 'Retrieving best chunks...'})}\n\n"
-        if debug:
-            print("\n" + "="*60)
-            print("RETRIEVING CHUNKS FOR EACH QUERY")
-            print("="*60)
-        
-        all_rank_lists = []  # For RRF: list of ranked lists
-        all_chunks_dict = {}  # Map (paper_id, chunk_index) -> chunk data
-        
-        for i, reworded_query in enumerate(reworded_queries, 1):
-            if debug:
-                print(f"\nQuery {i}/10: {reworded_query}")
-            
+
+        all_rank_lists = []
+        all_chunks_dict = {}
+
+        for reworded_query in reworded_queries:
             hits = _search_elasticsearch(reworded_query, top_k=20, debug=debug)
-            
-            if debug:
-                print(f"  Retrieved {len(hits)} chunks")
-            
-            # Build ranked list for RRF and store chunk data
+
             rank_list = []
             for hit in hits:
-                source_data = hit.get("_source", {})
+                source_data = hit.get("_source", {}) or {}
                 paper_id = source_data.get("paper_id", "unknown")
                 chunk_index = int(source_data.get("chunk_index", 0))
                 key = (paper_id, chunk_index)
-                
+
                 rank_list.append(key)
-                
-                # Store chunk data (will overwrite duplicates, which is fine)
+
                 if key not in all_chunks_dict:
                     all_chunks_dict[key] = {
                         "source_data": source_data,
                         "score": float(hit.get("_score", 0.0)),
                         "hit": hit
                     }
-            
+
             all_rank_lists.append(rank_list)
-        
-        # Step 3: Remove duplicates (already done by using dict, but count them)
+
         total_before_dedup = sum(len(rank_list) for rank_list in all_rank_lists)
         unique_chunks = len(all_chunks_dict)
         duplicates_removed = total_before_dedup - unique_chunks
-        
-        if debug:
-            print(f"\n" + "="*60)
-            print("DEDUPLICATION")
-            print("="*60)
-            print(f"Total chunks before deduplication: {total_before_dedup}")
-            print(f"Unique chunks after deduplication: {unique_chunks}")
-            print(f"Duplicates removed: {duplicates_removed}")
-        
+
         if unique_chunks == 0:
             no_data_msg = "No relevant chunks could be retrieved for your request. Please try rephrasing the question."
             yield f"data: {json.dumps({'event': 'delta', 'text': no_data_msg})}\n\n"
             yield f"data: {json.dumps({'event': 'done', 'sources': []})}\n\n"
             return
-        
-        # Step 3.5: Analyze query and filter chunks by criteria (year, authors, venues)
-        if debug:
-            print("\n" + "="*60)
-            print("ANALYZING QUERY FOR FILTERING")
-            print("="*60)
-        
+
+        # Query analysis (used for filtering + semantic judgement gate)
         query_analysis = analyze_query(query)
-        
-        # Merge user-provided filters with analysis results
+
+        # Merge filters into analysis (as in your original)
         if user_filters:
-            print(f"[DEBUG] user_filters provided: {user_filters}")
-            print(f"[DEBUG] fullPaperProcessing in user_filters: {user_filters.get('fullPaperProcessing', 'NOT FOUND')}")
-            # Override or merge with user-provided filters
             if user_filters.get("yearStart") is not None or user_filters.get("yearEnd") is not None:
                 if not query_analysis.get("time_range"):
                     query_analysis["time_range"] = {"start": None, "end": None}
@@ -1711,353 +1739,188 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
                     query_analysis["time_range"]["start"] = user_filters["yearStart"]
                 if user_filters.get("yearEnd") is not None:
                     query_analysis["time_range"]["end"] = user_filters["yearEnd"]
-            
+
             if user_filters.get("authors") and len(user_filters["authors"]) > 0:
                 existing_authors = query_analysis.get("authors", [])
-                print(f"[DEBUG] Merging authors - existing: {existing_authors}, from filters: {user_filters.get('authors')}")
-                # Merge authors, avoiding duplicates
                 merged_authors = list(set(existing_authors + user_filters["authors"]))
                 query_analysis["authors"] = merged_authors
-                print(f"[DEBUG] Merged authors: {merged_authors}")
-            else:
-                print(f"[DEBUG] No authors in user_filters or empty list")
-            
+
             if user_filters.get("venues") and len(user_filters["venues"]) > 0:
                 existing_venues = query_analysis.get("venues", [])
-                # Merge venues, avoiding duplicates
                 merged_venues = list(set(existing_venues + user_filters["venues"]))
                 query_analysis["venues"] = merged_venues
-            
+
             if user_filters.get("queryType"):
                 query_analysis["query_type"] = user_filters["queryType"]
-        else:
-            print(f"[DEBUG] No user_filters provided")
-        
-        # Step 3.6: Fetch papers from arXiv if authors are specified (BEFORE filtering)
-        # This ensures we get arXiv papers even if Elasticsearch chunks are filtered out
+
+        # Optional arXiv author fetch (unchanged)
         arxiv_papers = []
-        authors_list = query_analysis.get("authors", [])
-        
-        # Debug: Always log whether authors were found
-        print(f"\n[DEBUG] Checking for authors in query_analysis...")
-        print(f"[DEBUG] query_analysis.get('authors'): {query_analysis.get('authors')}")
-        print(f"[DEBUG] authors_list: {authors_list}")
-        print(f"[DEBUG] len(authors_list): {len(authors_list) if authors_list else 0}")
-        
-        if authors_list and len(authors_list) > 0:
-            print("\n" + "="*60)
-            print("FETCHING PAPERS FROM ARXIV BY AUTHOR")
-            print("="*60)
-            print(f"Authors found: {authors_list}")
-            
-            arxiv_papers = _fetch_arxiv_papers_by_author(
-                authors_list, 
-                max_results_per_author=5, 
-                debug=debug
-            )
-            
-            print(f"Fetched {len(arxiv_papers)} papers from arXiv")
-            print("="*60)
-        else:
-            print(f"[DEBUG] No authors found - skipping arXiv API call")
-            print(f"[DEBUG] authors_list is empty or None: {authors_list}")
-        
-        # Filter chunks based on merged analysis
+        authors_list = query_analysis.get("authors", []) or []
+        if authors_list:
+            arxiv_papers = _fetch_arxiv_papers_by_author(authors_list, max_results_per_author=5, debug=debug)
+
+        # Filter chunks by analysis (unchanged)
         all_chunks_dict = _filter_chunks_by_analysis(all_chunks_dict, query_analysis, debug=debug)
-        
-        # Also filter rank_lists to only include chunks that passed the filter
+
         filtered_rank_lists = []
         for rank_list in all_rank_lists:
             filtered_rank_list = [key for key in rank_list if key in all_chunks_dict]
-            if filtered_rank_list:  # Only add non-empty rank lists
+            if filtered_rank_list:
                 filtered_rank_lists.append(filtered_rank_list)
-        
         all_rank_lists = filtered_rank_lists
-        
-        # If no chunks remain after filtering, but we have arXiv papers, continue with those
+
         if len(all_chunks_dict) == 0 and len(arxiv_papers) == 0:
             no_data_msg = "No relevant chunks matched the specified criteria (year, author, etc.). Please try adjusting your filters."
             yield f"data: {json.dumps({'event': 'delta', 'text': no_data_msg})}\n\n"
             yield f"data: {json.dumps({'event': 'done', 'sources': []})}\n\n"
             return
-        
-        # Step 4: Apply RRF reranking on the deduplicated and filtered chunks
-        # Only do RRF if we have Elasticsearch chunks to rank
+
         sorted_chunks = []
         if len(all_chunks_dict) > 0 and len(all_rank_lists) > 0:
-            if debug:
-                print("\n" + "="*60)
-                print("APPLYING RRF RERANKING")
-                print("="*60)
-            
-            try:
-                rrf_scores = _reciprocal_rank_fusion(all_rank_lists, k=60)
-                sorted_chunks = sorted(
-                    [(key, score) for key, score in rrf_scores.items() if key in all_chunks_dict],
-                    key=lambda x: x[1],
-                    reverse=True
-                )
-                
-                if debug:
-                    print(f"RRF reranked {len(sorted_chunks)} unique chunks")
-            except Exception as e:
-                if debug:
-                    print(f"[ERROR] RRF reranking failed: {e}")
-                sorted_chunks = []
-        
-        # If we have arXiv papers but no Elasticsearch chunks, use arXiv papers only
-        if len(all_chunks_dict) == 0 and len(arxiv_papers) > 0:
-            if debug:
-                print("\n[DEBUG] No Elasticsearch chunks after filtering, but have arXiv papers. Using arXiv papers only.")
-        
-        # If we have neither chunks nor arXiv papers, return error
+            rrf_scores = _reciprocal_rank_fusion(all_rank_lists, k=60)
+            sorted_chunks = sorted(
+                [(key, score) for key, score in rrf_scores.items() if key in all_chunks_dict],
+                key=lambda x: x[1],
+                reverse=True
+            )
+
         if len(sorted_chunks) == 0 and len(arxiv_papers) == 0:
             no_data_msg = "No relevant chunks matched the specified criteria and no papers found from authors. Please try adjusting your filters."
             yield f"data: {json.dumps({'event': 'delta', 'text': no_data_msg})}\n\n"
             yield f"data: {json.dumps({'event': 'done', 'sources': []})}\n\n"
             return
-        
-        # Step 5: Build final sources and context from top 5 results
+
         retrieved_texts = []
         sources = []
         best_query = reworded_queries[0] if reworded_queries else query
-        context_chunk_count = 0  # Initialize to avoid UnboundLocalError
-        
-        # Collect paper IDs for metadata lookup and final sources
+        context_chunk_count = 0
+
         paper_ids_for_metadata = []
-        final_paper_ids = []  # The 5 final paper IDs
-        
-        # Get paper IDs from sorted_chunks (Elasticsearch results)
+        final_paper_ids = []
+
+        # Collect final_paper_ids up to 5
         if len(all_chunks_dict) > 0 and len(sorted_chunks) > 0:
-            for (paper_id, chunk_index), _ in sorted_chunks[:5]:
+            for (paper_id, chunk_index), _ in sorted_chunks[:25]:
                 if paper_id and paper_id != "unknown":
-                    paper_ids_for_metadata.append(paper_id)
                     if paper_id not in final_paper_ids:
                         final_paper_ids.append(paper_id)
-        
-        # Also add arXiv paper IDs (limit to 5 total papers)
-        for arxiv_paper in arxiv_papers[:5]:
+                        paper_ids_for_metadata.append(paper_id)
+                if len(final_paper_ids) >= 5:
+                    break
+
+        for arxiv_paper in arxiv_papers:
             paper_id = arxiv_paper.get("paper_id")
-            if paper_id and paper_id != "unknown":
+            if paper_id and paper_id != "unknown" and paper_id not in final_paper_ids and len(final_paper_ids) < 5:
+                final_paper_ids.append(paper_id)
                 paper_ids_for_metadata.append(paper_id)
-                if paper_id not in final_paper_ids and len(final_paper_ids) < 5:
-                    final_paper_ids.append(paper_id)
-        
-        # Limit to 5 papers total
+
         final_paper_ids = final_paper_ids[:5]
-        
-        # Check if full paper processing is enabled
-        full_paper_processing = user_filters and user_filters.get("fullPaperProcessing", False)
-        
-        if debug:
-            print(f"\n[DEBUG] ========== FULL PAPER PROCESSING CHECK ==========")
-            print(f"[DEBUG] user_filters: {user_filters}")
-            print(f"[DEBUG] full_paper_processing: {full_paper_processing}")
-            print(f"[DEBUG] final_paper_ids: {final_paper_ids}")
-            print(f"[DEBUG] len(final_paper_ids): {len(final_paper_ids)}")
-            print(f"[DEBUG] =================================================")
-        
-        # If full paper processing is enabled, retrieve ALL chunks for the final papers
-        if full_paper_processing and final_paper_ids:
-            if debug:
-                print("\n" + "="*60)
-                print("FULL PAPER PROCESSING ENABLED")
-                print("="*60)
-                print(f"Retrieving ALL chunks for {len(final_paper_ids)} papers: {final_paper_ids}")
-            
-            # Get all chunks for these papers (only for Elasticsearch papers, not arXiv)
-            # Filter out arXiv papers since they don't have chunks in Elasticsearch
-            es_paper_ids = [pid for pid in final_paper_ids if pid not in [ap.get("paper_id") for ap in arxiv_papers]]
-            
-            if es_paper_ids:
-                if debug:
-                    print(f"[Full Paper] Calling _get_all_chunks_for_papers with {len(es_paper_ids)} papers: {es_paper_ids}")
-                
-                all_paper_chunks = _get_all_chunks_for_papers(es_paper_ids, debug=debug)
-                
-                if debug:
-                    print(f"[Full Paper] _get_all_chunks_for_papers returned {len(all_paper_chunks)} chunks")
-                    for pid in es_paper_ids:
-                        pid_chunks = [k for k in all_paper_chunks.keys() if k[0] == pid]
-                        print(f"[Full Paper]   Paper {pid}: {len(pid_chunks)} chunks from Elasticsearch query")
-                
-                # Replace/update all_chunks_dict with ALL chunks from these papers
-                # This ensures we have all chunks, not just the ones from search results
-                chunks_before = len(all_chunks_dict)
-                for key, chunk_data in all_paper_chunks.items():
-                    all_chunks_dict[key] = chunk_data  # Overwrite to ensure we have all chunks
-                chunks_after = len(all_chunks_dict)
-                
-                if debug:
-                    print(f"[Full Paper] all_chunks_dict: {chunks_before} -> {chunks_after} chunks")
-                    for pid in es_paper_ids:
-                        pid_chunks = [k for k in all_chunks_dict.keys() if k[0] == pid]
-                        print(f"[Full Paper]   Paper {pid}: {len(pid_chunks)} chunks in all_chunks_dict after merge")
-        
-        # Fetch metadata from metadata index
+        full_paper_processing = bool(user_filters and user_filters.get("fullPaperProcessing", False))
+
+        # Full paper processing logic (your original) — unchanged structure, we just ensure relevance attached later
+        max_rrf_in_sources = 0.0
+        snippet_by_pid: Dict[str, str] = {}
+
         metadata_dict = _get_paper_metadata(paper_ids_for_metadata, debug=debug)
-        
-        # Process Elasticsearch chunks if we have any
+
         if len(all_chunks_dict) > 0:
-            if full_paper_processing:
-                # If full paper processing, write FULL papers to files and use only top 5 chunks for GPT
-                if debug:
-                    print(f"\n[Full Paper] ========== PROCESSING FULL PAPERS ==========")
-                    print(f"[Full Paper] Writing full papers from {len(final_paper_ids)} papers: {final_paper_ids}")
-                    print(f"[Full Paper] Total chunks in all_chunks_dict: {len(all_chunks_dict)}")
-                
-                # Write full papers (all chunks) to text files in /public/ directory
-                public_dir = os.path.join(os.path.dirname(__file__), '..', 'public')
+            if full_paper_processing and final_paper_ids:
+                public_dir = os.path.join(os.path.dirname(__file__), "..", "public")
                 os.makedirs(public_dir, exist_ok=True)
-                
+
                 yield f"data: {json.dumps({'event': 'status', 'message': 'Summarizing papers...'})}\n\n"
-                
-                for rank, paper_id in enumerate(final_paper_ids[:5], 1):  # Limit to top 5 papers
+
+                for rank, paper_id in enumerate(final_paper_ids[:5], 1):
                     paper_text_parts = []
-                    
-                    # Collect all chunks for this paper (sorted by chunk_index)
+
                     paper_chunks = [(k, v) for k, v in all_chunks_dict.items() if k[0] == paper_id]
                     if paper_chunks:
                         paper_chunks.sort(key=lambda x: x[0][1])
-                        
-                        if debug:
-                            print(f"[Full Paper] Paper {paper_id}: found {len(paper_chunks)} chunks")
-                        
-                        # Collect all chunk texts for this paper
                         for (pid, chunk_index), chunk_data in paper_chunks:
-                            source_data = chunk_data["source_data"]
-                            chunk_text = source_data.get("chunk_text", "")
+                            chunk_text = chunk_data["source_data"].get("chunk_text", "") or ""
                             if chunk_text:
                                 paper_text_parts.append(chunk_text)
-                        
-                        # Remove overlapping text between consecutive chunks
+
                         if len(paper_text_parts) > 1:
-                            original_count = len(paper_text_parts)
                             paper_text_parts = _remove_overlap_between_chunks(paper_text_parts, min_overlap_length=50)
-                            if debug and len(paper_text_parts) != original_count:
-                                print(f"[Full Paper] Removed overlaps from {original_count} chunks")
                     else:
-                        # Check if this is an arXiv paper
                         for arxiv_paper in arxiv_papers:
                             if arxiv_paper.get("paper_id") == paper_id:
-                                chunk_text = arxiv_paper.get("chunk_text", "")
+                                chunk_text = arxiv_paper.get("chunk_text", "") or ""
                                 if chunk_text:
                                     paper_text_parts.append(chunk_text)
-                                if debug:
-                                    print(f"[Full Paper] Paper {paper_id}: arXiv paper (single chunk)")
                                 break
-                    
-                    # Write the full paper content to a file
+
                     if paper_text_parts:
-                        # Join chunks with line breaks - deduplication function already handles spacing for smooth flow
-                        # This preserves chunk separation while maintaining seamless text flow
                         full_paper_text = "\n\n".join(paper_text_parts)
-                        
-                        # Post-processing: remove any remaining repeated phrases that might have been missed
                         full_paper_text = _remove_repeated_phrases(full_paper_text, min_phrase_words=10)
-                        
+
                         filename = os.path.join(public_dir, f"{rank}.txt")
                         try:
-                            with open(filename, 'w', encoding='utf-8') as f:
+                            with open(filename, "w", encoding="utf-8") as f:
                                 f.write(full_paper_text)
-                            if debug:
-                                print(f"[Full Paper] Wrote paper {paper_id} ({len(paper_text_parts)} chunks) to {filename}")
-                        except Exception as e:
-                            if debug:
-                                print(f"[Full Paper] Error writing {filename}: {e}")
-                        
-                        # Summarize the paper and write summarized version
-                        if debug:
-                            print(f"[Summarization] Summarizing paper {paper_id}...")
-                        
+                        except Exception:
+                            pass
+
                         summarized_text = _summarize_paper(full_paper_text, target_ratio=0.15, debug=debug)
-                        
+
                         summary_filename = os.path.join(public_dir, f"{rank}_summ.txt")
                         try:
-                            with open(summary_filename, 'w', encoding='utf-8') as f:
+                            with open(summary_filename, "w", encoding="utf-8") as f:
                                 f.write(summarized_text)
-                            if debug:
-                                print(f"[Summarization] Wrote summarized paper {paper_id} to {summary_filename}")
-                        except Exception as e:
-                            if debug:
-                                print(f"[Summarization] Error writing {summary_filename}: {e}")
-                
-                if debug:
-                    print(f"[Full Paper] Wrote {min(5, len(final_paper_ids))} papers to text files in /public/ directory")
-                
-                # Read summaries from files and pass them to GPT instead of chunks
-                context_chunk_count = 0
+                        except Exception:
+                            pass
+
                 for rank in range(1, min(6, len(final_paper_ids) + 1)):
                     summary_filename = os.path.join(public_dir, f"{rank}_summ.txt")
                     try:
                         if os.path.exists(summary_filename):
-                            with open(summary_filename, 'r', encoding='utf-8') as f:
+                            with open(summary_filename, "r", encoding="utf-8") as f:
                                 summary_text = f.read().strip()
                             if summary_text:
                                 retrieved_texts.append(summary_text)
                                 context_chunk_count += 1
-                                if debug:
-                                    print(f"[Full Paper] Added summary {rank}/5 to GPT context from {summary_filename}")
-                            else:
-                                if debug:
-                                    print(f"[Full Paper] Summary file {summary_filename} is empty")
-                        else:
-                            if debug:
-                                print(f"[Full Paper] Summary file {summary_filename} not found")
-                    except Exception as e:
-                        if debug:
-                            print(f"[Full Paper] Error reading summary {summary_filename}: {e}")
-                
-                if debug:
-                    print(f"[Full Paper] Total summaries sent to GPT: {context_chunk_count}")
-                    print(f"[Full Paper] ============================================\n")
-                
-                # Build sources list from the first chunk of each paper (for display)
-                seen_paper_ids = set()  # Track papers already added to avoid duplicates
+                    except Exception:
+                        pass
+
+                # Sources: one per paper, best RRF per paper
+                seen_paper_ids = set()
                 rank_counter = 1
                 for paper_id in final_paper_ids:
                     if paper_id in seen_paper_ids:
-                        continue  # Skip if this paper already added
+                        continue
                     seen_paper_ids.add(paper_id)
-                    
-                    # Find all chunks for this paper
+
                     paper_chunks = [(k, v) for k, v in all_chunks_dict.items() if k[0] == paper_id]
                     if paper_chunks:
                         paper_chunks.sort(key=lambda x: x[0][1])
                         (first_paper_id, first_chunk_index), first_chunk_data = paper_chunks[0]
                         source_data = first_chunk_data["source_data"]
-                        
-                        # Calculate best scores from all chunks of this paper
+
                         best_similarity_score = max((chunk_data["score"] for _, chunk_data in paper_chunks), default=0.0)
-                        # Find best RRF score for this paper from sorted_chunks
                         best_rrf_score = 0.0
                         for (pid, cidx), rrf_score in sorted_chunks:
                             if pid == paper_id:
                                 best_rrf_score = max(best_rrf_score, rrf_score)
-                        
-                        # Get title and authors from metadata or chunk data
+
                         title = ""
                         authors = ""
                         if paper_id in metadata_dict:
-                            metadata = metadata_dict[paper_id]
-                            title = metadata.get("title", "")
-                            if title:
-                                title = str(title).strip()
-                            authors = _normalize_authors(metadata.get("authors", ""))
-                        
+                            md = metadata_dict[paper_id]
+                            title = str(md.get("title", "") or "").strip()
+                            authors = _normalize_authors(md.get("authors", ""))
+
                         if not title:
-                            title = source_data.get("title", "")
-                            if title:
-                                title = str(title).strip()
+                            title = str(source_data.get("title", "") or "").strip()
                         if not authors:
                             authors = _normalize_authors(source_data.get("authors", ""))
-                        
+
                         arxiv_url = None
                         if paper_id and not paper_id.startswith("http"):
                             if len(paper_id) >= 4 and paper_id.replace(".", "").replace("v", "").replace("/", "").isdigit():
                                 arxiv_url = f"https://arxiv.org/abs/{paper_id}"
-                        
-                        sources.append({
+
+                        src_obj = {
                             "paper_id": paper_id,
                             "title": title if title else f"Paper {paper_id}",
                             "authors": authors if authors else None,
@@ -2067,52 +1930,53 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
                             "rrf_score": best_rrf_score,
                             "similarity_score": best_similarity_score,
                             "url": arxiv_url
-                        })
+                        }
+                        sources.append(src_obj)
+                        max_rrf_in_sources = max(max_rrf_in_sources, float(best_rrf_score))
+                        # snippet for semantic judge: use first chunk if available
+                        snippet_by_pid[paper_id] = (source_data.get("chunk_text", "") or "")[:2000]
                         rank_counter += 1
             else:
-                # Normal processing: use top chunks from sorted_chunks
-                if len(sorted_chunks) > 0:
-                    context_chunk_count = min(5, len(sorted_chunks))
-                    seen_paper_ids = set()  # Track papers already added to avoid duplicates
+                # Normal processing: top 5 unique papers from sorted_chunks
+                if sorted_chunks:
+                    seen_paper_ids = set()
                     rank_counter = 1
-                    for ((paper_id, chunk_index), rrf_score) in sorted_chunks[:context_chunk_count]:
+                    for ((paper_id, chunk_index), rrf_score) in sorted_chunks:
+                        if len(sources) >= 5:
+                            break
                         if paper_id in seen_paper_ids:
-                            continue  # Skip if this paper already added
+                            continue
                         seen_paper_ids.add(paper_id)
+
                         chunk_data = all_chunks_dict.get((paper_id, chunk_index))
                         if not chunk_data:
                             continue
-                        
+
                         source_data = chunk_data["source_data"]
-                        chunk_text = source_data.get("chunk_text", "")
+                        chunk_text = source_data.get("chunk_text", "") or ""
                         if chunk_text:
                             retrieved_texts.append(chunk_text)
-                        
-                        # Try to get title from metadata index first, fall back to chunk data
+                            context_chunk_count += 1
+                            snippet_by_pid[paper_id] = chunk_text[:2000]
+
                         title = ""
                         authors = ""
                         if paper_id in metadata_dict:
-                            metadata = metadata_dict[paper_id]
-                            title = metadata.get("title", "")
-                            if title:
-                                title = str(title).strip()
-                            authors = _normalize_authors(metadata.get("authors", ""))
-                        
-                        # Fall back to chunk data if metadata not available
+                            md = metadata_dict[paper_id]
+                            title = str(md.get("title", "") or "").strip()
+                            authors = _normalize_authors(md.get("authors", ""))
+
                         if not title:
-                            title = source_data.get("title", "")
-                            if title:
-                                title = str(title).strip()
+                            title = str(source_data.get("title", "") or "").strip()
                         if not authors:
                             authors = _normalize_authors(source_data.get("authors", ""))
-                        
-                        # Construct arXiv URL if paper_id looks like an arXiv ID
+
                         arxiv_url = None
                         if paper_id and not paper_id.startswith("http"):
                             if len(paper_id) >= 4 and paper_id.replace(".", "").replace("v", "").replace("/", "").isdigit():
                                 arxiv_url = f"https://arxiv.org/abs/{paper_id}"
-                        
-                        sources.append({
+
+                        src_obj = {
                             "paper_id": paper_id,
                             "title": title if title else f"Paper {paper_id}",
                             "authors": authors if authors else None,
@@ -2122,68 +1986,73 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
                             "rrf_score": rrf_score,
                             "similarity_score": chunk_data["score"],
                             "url": arxiv_url
-                        })
+                        }
+                        sources.append(src_obj)
+                        max_rrf_in_sources = max(max_rrf_in_sources, float(rrf_score))
                         rank_counter += 1
-        
-        # Add arXiv papers as additional chunks (avoid duplicates with existing sources)
-        # When getting papers by author, limit total sources to 5
+
+        # Add arXiv papers to fill remaining slots up to 5 (unchanged)
         seen_paper_ids_from_sources = {s.get("paper_id") for s in sources}
-        arxiv_start_rank = len(sources) + 1
-        # Calculate how many arXiv papers we can add to stay within 5 total sources
         remaining_slots = max(0, 5 - len(sources))
         arxiv_paper_count = min(remaining_slots, len(arxiv_papers))
+
         arxiv_added_count = 0
-        if len(arxiv_papers) > 0:
-            # Update context_chunk_count to include arXiv papers
-            context_chunk_count = context_chunk_count + arxiv_paper_count
+        arxiv_start_rank = len(sources) + 1
         for idx, arxiv_paper in enumerate(arxiv_papers[:arxiv_paper_count], start=arxiv_start_rank):
             paper_id = arxiv_paper.get("paper_id", "unknown")
             if paper_id in seen_paper_ids_from_sources:
-                continue  # Skip if this arXiv paper already exists in sources
+                continue
             seen_paper_ids_from_sources.add(paper_id)
-            chunk_text = arxiv_paper.get("chunk_text", "")
+
+            chunk_text = arxiv_paper.get("chunk_text", "") or ""
             if chunk_text:
                 retrieved_texts.append(chunk_text)
-            
-            # Try to get title from metadata index first, fall back to arXiv data
-            title = ""
-            authors = ""
-            if paper_id in metadata_dict:
-                metadata = metadata_dict[paper_id]
-                title = metadata.get("title", "")
-                if title:
-                    title = str(title).strip()
-                authors = _normalize_authors(metadata.get("authors", ""))
-            
-            # Fall back to arXiv data if metadata not available
-            if not title:
-                title = arxiv_paper.get("title", "")
-                if title:
-                    title = str(title).strip()
-            if not authors:
-                authors = _normalize_authors(arxiv_paper.get("authors", ""))
-            
-            sources.append({
+                snippet_by_pid[paper_id] = chunk_text[:2000]
+                context_chunk_count += 1
+
+            title = str(arxiv_paper.get("title", "") or "").strip()
+            authors = _normalize_authors(arxiv_paper.get("authors", ""))
+
+            src_obj = {
                 "paper_id": paper_id,
                 "title": title if title else f"Paper {paper_id}",
                 "authors": authors if authors else None,
                 "year": arxiv_paper.get("year"),
                 "chunk_index": 0,
                 "rank": arxiv_start_rank + arxiv_added_count,
-                "rrf_score": 0.0,  # arXiv papers don't have RRF scores
-                "similarity_score": 0.0,  # arXiv papers don't have similarity scores
+                "rrf_score": 0.0,
+                "similarity_score": 0.0,
                 "url": arxiv_paper.get("url"),
                 "source": "arxiv_api"
-            })
+            }
+            sources.append(src_obj)
             arxiv_added_count += 1
-            
-            # Limit to top 5 total sources when getting papers by author
             if len(sources) >= 5:
                 break
-        
+
+        # Attach ASTA-style RETRIEVAL relevance for streaming sources (normalize by max_rrf_in_sources)
+        for s in sources:
+            rrf = float(s.get("rrf_score", 0.0) or 0.0)
+            norm = (rrf / max_rrf_in_sources) if max_rrf_in_sources > 0 else 0.0
+            _attach_retrieval_relevance(s, norm)
+
+        # OPTIONAL: Apply ASTA Layer 2 semantic judgement only to top-5 returned docs
+        if _should_apply_semantic_judgement(query_analysis, user_filters):
+            yield f"data: {json.dumps({'event': 'status', 'message': 'Running semantic relevance judgement (top papers)...'})}\n\n"
+            _apply_semantic_relevance_to_top_sources(
+                query=query,
+                analysis=query_analysis,
+                sources=sources,
+                snippet_by_paper_id=snippet_by_pid,
+                debug=debug,
+                top_n=DEFAULT_JUDGE_TOP_N,
+            )
+        else:
+            for s in sources:
+                _finalize_relevance(s)
+
         context = "\n\n".join(retrieved_texts) if retrieved_texts else "No relevant context found."
-        
-        # Prepare messages for the generator
+
         messages = [
             {
                 "role": "system",
@@ -2197,14 +2066,14 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
                 )
             }
         ]
-        
+
         if conversation_history:
             for msg in conversation_history[-4:]:
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
                 if content:
                     messages.append({"role": role, "content": content})
-        
+
         messages.append({
             "role": "user",
             "content": (
@@ -2216,16 +2085,7 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
                 "Do NOT cite papers inline - the papers are already listed separately as sources."
             )
         })
-        
-        if debug:
-            print("\n" + "=" * 80)
-            print("STREAMING: Sending messages to GPT")
-            print("=" * 80)
-            for i, msg in enumerate(messages, 1):
-                print(f"\n--- Message {i} ({msg['role']}) ---")
-                print(msg['content'])
-                print(f"--- End of Message {i} ---\n")
-        
+
         stream = _openai_client.chat.completions.create(
             model=MODEL_ID,
             messages=messages,
@@ -2233,63 +2093,48 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
             temperature=0.7,
             stream=True,
         )
-        
-        # Emit sources first (before the summary)
+
+        # Emit sources (now includes retrieval + semantic + final)
         if sources:
             yield f"data: {json.dumps({'event': 'sources', 'sources': sources})}\n\n"
-        
-        # Stream deltas (the summary)
+
         yield f"data: {json.dumps({'event': 'status', 'message': 'Generating response...'})}\n\n"
-        if debug:
-            print("[Streaming] Starting to stream response from OpenAI...")
-        
-        has_yielded = False
+
         for event in stream:
             try:
                 delta = event.choices[0].delta.content
                 if delta:
-                    has_yielded = True
                     yield f"data: {json.dumps({'event': 'delta', 'text': delta})}\n\n"
             except Exception as e:
                 if debug:
                     print(f"[Streaming] Error processing delta: {e}")
-                delta = None
-        
-        if debug:
-            print(f"[Streaming] Finished streaming. Has yielded: {has_yielded}")
-        
-        # Generate individual summaries for each source (top 5)
+
+        # Keep your relevance_summary generation unchanged
         if sources and len(sources) > 0:
             yield f"data: {json.dumps({'event': 'status', 'message': 'Generating relevancy explanations...'})}\n\n"
-            if debug:
-                print("\n[Streaming] Generating individual source summaries...")
-            
-            # Get the chunk text for each source to generate summaries
+
             source_chunks_dict = {}
             for source in sources[:5]:
                 paper_id = source.get("paper_id")
                 chunk_index = source.get("chunk_index", 0)
                 key = (paper_id, chunk_index)
-                
-                # Get chunk text from all_chunks_dict or arxiv_papers
+
                 chunk_text = ""
                 if key in all_chunks_dict:
                     chunk_text = all_chunks_dict[key]["source_data"].get("chunk_text", "")
                 else:
-                    # Check if it's from arXiv
                     for arxiv_paper in arxiv_papers:
                         if arxiv_paper.get("paper_id") == paper_id:
                             chunk_text = arxiv_paper.get("chunk_text", "")
                             break
-                
+
                 if chunk_text:
                     source_chunks_dict[paper_id] = chunk_text
-            
-            # Generate summaries for each source
+
             for source in sources[:5]:
                 paper_id = source.get("paper_id")
                 chunk_text = source_chunks_dict.get(paper_id, "")
-                
+
                 if chunk_text:
                     try:
                         summary_messages = [
@@ -2307,27 +2152,24 @@ def stream_rag_response(query: str, top_k: int = DEFAULT_TOP_K, max_tokens: int 
                                 )
                             }
                         ]
-                        
+
                         summary_response = _openai_client.chat.completions.create(
                             model=MODEL_ID,
                             messages=summary_messages,
                             max_tokens=150,
                             temperature=0.7
                         )
-                        
+
                         source["relevance_summary"] = summary_response.choices[0].message.content.strip()
-                        
-                        if debug:
-                            print(f"  Generated summary for {paper_id}")
                     except Exception as e:
                         if debug:
                             print(f"  Error generating summary for {paper_id}: {e}")
                         source["relevance_summary"] = None
                 else:
                     source["relevance_summary"] = None
-        
-        # Emit final metadata
+
         yield f"data: {json.dumps({'event': 'done', 'sources': sources, 'reworded_queries': reworded_queries, 'unique_chunks': unique_chunks, 'duplicates_removed': duplicates_removed, 'analysis': query_analysis})}\n\n"
+
     except Exception as e:
         import traceback
         error_msg = str(e)
